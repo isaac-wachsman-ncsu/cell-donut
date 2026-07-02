@@ -72,6 +72,14 @@ class VelocityFieldEstimator:
             (contiguous in the circular coordinate) that seeds the stationarity
             term. Must be small enough that the clump does not already resemble
             ``p_data`` (so reproducing it requires flowing around the cycle).
+        stationarity_burnin_loops: Number of cycles the localized seed is flowed
+            *without gradients* before sampling, so it settles onto the field's
+            attractor (limit cycle). This makes the stationarity marginal reflect
+            the true stationary distribution rather than the initial transient,
+            and truncating the gradient here avoids ill-conditioned backprop
+            through the long transient.
+        stationarity_sample_loops: Number of cycles (with gradients) pooled after
+            burn-in to form the stationarity marginal; ``>= 1`` covers the cycle.
         normalize_cost: Rescale OT cost matrices to an ``O(1)`` scale.
         lr: Learning rate.
         weight_decay: Optimiser weight decay.
@@ -107,6 +115,8 @@ class VelocityFieldEstimator:
         sinkhorn_iter: int = 200,
         stationarity_n_points: int = 256,
         stationarity_seed_frac: float = 0.2,
+        stationarity_burnin_loops: float = 3.0,
+        stationarity_sample_loops: float = 1.0,
         normalize_cost: bool = True,
         lr: float = 1e-3,
         weight_decay: float = 0.0,
@@ -136,6 +146,8 @@ class VelocityFieldEstimator:
         self.sinkhorn_iter = int(sinkhorn_iter)
         self.stationarity_n_points = int(stationarity_n_points)
         self.stationarity_seed_frac = float(stationarity_seed_frac)
+        self.stationarity_burnin_loops = float(stationarity_burnin_loops)
+        self.stationarity_sample_loops = float(stationarity_sample_loops)
         self.normalize_cost = bool(normalize_cost)
 
         self.lr = float(lr)
@@ -327,11 +339,19 @@ class VelocityFieldEstimator:
                 loss_align = L.angular_alignment_loss(self.model(x0), g0)
                 loss_ot_sub = L.cycle_consistency_loss(x0, result.endpoint, **sk)
 
-                # Stationarity: flow a localized arc around the cycle and match
-                # the pooled (uniform-in-time) trajectory to the full data.
+                # Stationarity: flow a localized arc onto the attractor (burn-in,
+                # no grad) so the pooled marginal reflects the true limit-cycle
+                # distribution, then match a short grad-carrying sampling rollout
+                # to the full data.
                 s = int(torch.randint(0, n, (1,)).item())
                 arc = theta_order[(s + torch.arange(seed_w, device=self.device)) % n]
-                loc_result = integrator(X[arc], t_end=self.T)
+                x_seed = X[arc]
+                if self.stationarity_burnin_loops > 0:
+                    with torch.no_grad():
+                        x_seed = integrator(
+                            x_seed, t_end=self.stationarity_burnin_loops * self.T
+                        ).endpoint
+                loc_result = integrator(x_seed, t_end=self.stationarity_sample_loops * self.T)
                 loss_stationarity = L.stationarity_loss(
                     loc_result.trajectory, X, n_points=self.stationarity_n_points, **sk
                 )
