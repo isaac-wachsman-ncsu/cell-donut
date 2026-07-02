@@ -24,7 +24,7 @@ Drop the `velocity_ot/` package on your `PYTHONPATH` and `import velocity_ot`.
 import velocity_ot as vo
 
 est = vo.VelocityFieldEstimator(intrinsic_dim=1)   # 1 -> data live on a circle
-est.fit(adata, spatial_key="X_spatial", theta_key="theta", n_epochs=200)
+est.fit(adata, n_epochs=200)                        # reads adata.X + adata.obs['circular_coords']
 
 adata.obsm["velocity_field"]   # fitted velocities, shape [N, D]
 est.predict(new_points)        # evaluate v_φ at arbitrary out-of-sample points
@@ -34,38 +34,46 @@ est.predict(new_points)        # evaluate v_φ at arbitrary out-of-sample points
 
 | Role | Location | Shape |
 |------|----------|-------|
-| Coordinates `x` (input) | `adata.obsm[spatial_key]` | `[N, D]` |
-| Circular coordinate `θ` (input, radians) | `adata.obsm[theta_key]` | `[N]` or `[N, 1]` |
+| Coordinates `x` (input) | `adata.X` (default; or `obsm[spatial_key]`) | `[N, D]` |
+| Circular coordinate `θ` (input, radians) | `adata.obs['circular_coords']` (or `obsm`) | `[N]` |
 | Fitted velocity field (output) | `adata.obsm[velocity_key]` | `[N, D]` |
 | Estimated `∇θ` (output) | `adata.obsm[grad_theta_out_key]` | `[N, D]` |
 | Loss history + config (output) | `adata.uns["velocity_ot"]` | dict |
+
+Spatial coordinates are read from `adata.X` by default (pass `spatial_key="..."`
+to read from `obsm` instead); the circular coordinate is read from
+`adata.obs['circular_coords']` by default (`theta_key=` to change the name).
 
 ## The objective
 
 The field minimises a weighted sum of four terms:
 
 ```
-L = λ₁·L_KE + λ₂·L_OT_global + λ₃·L_align + λ₄·L_OT_sub
+L = λ₁·L_KE + λ₂·L_stationarity + λ₃·L_align + λ₄·L_OT_sub
 ```
 
 - **`L_KE` — kinetic energy.** The mean action `∫₀ᵀ ½‖v‖² dt` accumulated as
   points flow through one cycle (trapezoidal rule over the ODE trajectory).
   Regularises toward the gentlest flow.
-- **`L_OT_global` — stationarity.** Sinkhorn divergence between the initial
-  cloud `X₀` and the cloud evolved over one full cycle `X_T`. Since the
-  distribution is stationary, `X₀ ≈ X_T`.
+- **`L_stationarity` — time-marginal matches the data.** Seed a *localized* arc
+  of the circular coordinate, flow it around the cycle, pool the trajectory
+  positions sampled uniformly in time, and take the Sinkhorn divergence to the
+  entire data distribution. This forces the flow's own stationary (time-average)
+  density to equal `p_data`. Seeding from a localized clump is essential — a
+  random subset already looks like `p_data` and would be matched at zero speed.
 - **`L_align` — angular alignment.** `1 − cos(v_φ(x), ∇θ(x))`, averaged over
-  points. Fixes the *rotational direction*; scale-invariant. `∇θ` is estimated
-  from the circular coordinate by `circular_gradient.py` (local weighted
-  least-squares on wrapped edge differences).
-- **`L_OT_sub` — temporal anchor.** Optional. For a labelled sub-population with
-  known targets at an intermediate time `t'`, the Sinkhorn divergence between
-  the model-evolved sub-population and those targets. Ties latent time to
-  physical cycle time and thereby fixes the field's *speed*.
+  points. Fixes the *direction* of the field; scale-invariant. `∇θ` is estimated
+  from the circular coordinate by `circular_gradient.py`.
+- **`L_OT_sub` — cycle consistency.** Sinkhorn divergence between a subset and
+  the *same* subset evolved over one full cycle, `S(Φ_T(x₀), x₀)`. Source = sink;
+  enforces "go around once in `T = 1`" (an integer number of loops).
 
-Alignment and global-OT together pin down direction and shape but leave the
-speed loosely determined; supply a sub-population (`sub_source`, `sub_target`,
-`sub_time`) to anchor the physical speed.
+How speed is pinned: `L_stationarity` (localized seed) forces the flow to cover
+the whole cycle, i.e. **at least** one loop; `L_KE` trims to the *minimum* speed
+that still covers it (one loop); `L_OT_sub` keeps the period at an integer number
+of loops. Together they fix a single loop per cycle. On a rotationally
+*symmetric* ring `L_OT_sub` has little signal, but `L_stationarity` still pins
+the speed.
 
 ## Plotting
 

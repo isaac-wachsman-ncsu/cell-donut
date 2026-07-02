@@ -5,13 +5,14 @@ The composite training objective is
 .. math::
 
     \\mathcal{L} = \\lambda_1 \\mathcal{L}_{KE}
-                 + \\lambda_2 \\mathcal{L}_{OT\\_global}
+                 + \\lambda_2 \\mathcal{L}_{stationarity}
                  + \\lambda_3 \\mathcal{L}_{align}
                  + \\lambda_4 \\mathcal{L}_{OT\\_sub}
 
-with the four terms defined below. All optimal-transport terms use the
-``POT`` library through its PyTorch backend so gradients propagate to the
-network parameters.
+with the four terms defined below (``stationarity`` matches the flow's
+time-marginal density to the data; ``OT_sub`` enforces that a subset returns to
+itself after one cycle). All optimal-transport terms use the ``POT`` library
+through its PyTorch backend so gradients propagate to the network parameters.
 
 Numerical note
 --------------
@@ -32,6 +33,16 @@ import torch
 def _uniform_weights(n: int, ref: torch.Tensor) -> torch.Tensor:
     """Return a uniform histogram of length ``n`` matching ``ref``'s device/dtype."""
     return torch.full((n,), 1.0 / n, device=ref.device, dtype=ref.dtype)
+
+
+def _subsample(
+    x: torch.Tensor, n: int, generator: torch.Generator | None = None
+) -> torch.Tensor:
+    """Randomly select at most ``n`` rows of ``x`` (returns ``x`` unchanged if small)."""
+    if x.shape[0] <= n:
+        return x
+    idx = torch.randperm(x.shape[0], device=x.device, generator=generator)[:n]
+    return x[idx]
 
 
 def sinkhorn_divergence(
@@ -134,29 +145,100 @@ def kinetic_energy_loss(velocities: torch.Tensor, dt: float) -> torch.Tensor:
     return ke_path.mean()
 
 
-def global_ot_loss(
+def stationarity_loss(
+    trajectory: torch.Tensor,
+    data: torch.Tensor,
+    reg: float = 0.05,
+    n_points: int = 256,
+    include_endpoint: bool = False,
+    generator: torch.Generator | None = None,
+    **kwargs,
+) -> torch.Tensor:
+    r"""Match the flow's time-marginal density to the data distribution.
+
+    Take a subset of the data, evolve it under the field over one cycle, pool
+    the positions sampled *uniformly in time* along the resulting trajectories,
+    and compare that pooled cloud to the entire original data distribution. If
+    the learned dynamics are stationary in the same sense as the true dynamics,
+    the time-average of the pushed-forward density,
+
+    .. math::
+
+        \bar{\rho}(x) = \frac{1}{T} \int_0^T (\Phi_t)_\# \mu_{\mathrm{sub}}(x)\, dt,
+
+    equals the stationary data density :math:`p_{\mathrm{data}}`. This term is
+    the Sinkhorn divergence between an empirical estimate of
+    :math:`\bar{\rho}` (the pooled trajectory nodes) and ``data``.
+
+    Note that this constrains the *shape* of the density along the cycle (hence
+    the relative speed profile) but is invariant to the number of loops
+    completed in ``[0, T]``; the loop count is pinned by
+    :func:`cycle_consistency_loss` and the kinetic-energy term.
+
+    Important:
+        The ``trajectory`` should be integrated from a **localized** subset (a
+        small clump / arc that does *not* already resemble ``p_data``).
+        Otherwise the term is trivially satisfied at zero speed, because a
+        random subset already matches the data distribution without any motion.
+        :class:`velocity_ot.VelocityFieldEstimator` handles this by seeding from
+        a contiguous arc of the circular coordinate.
+
+    Args:
+        trajectory: Node positions from one integration over ``[0, T]``, shape
+            ``[K + 1, B, D]`` (as returned by
+            :func:`velocity_ot.dynamics.integrate`).
+        data: The full data cloud ``[N, D]`` (or a large sample of it).
+        reg: Entropic regularisation strength.
+        n_points: Cap on the number of points used on each side of the Sinkhorn
+            divergence (both the pooled cloud and ``data`` are randomly
+            subsampled to at most this many points for tractability).
+        include_endpoint: If ``True`` include the ``t = T`` node in the pool;
+            by default it is dropped so a closed cycle is not double-counted
+            (uniform sampling of ``[0, T)``).
+        generator: Optional RNG for the subsampling.
+        **kwargs: Forwarded to :func:`sinkhorn_divergence`.
+
+    Returns:
+        A scalar tensor.
+    """
+    if trajectory.dim() != 3:
+        raise ValueError(
+            f"Expected trajectory [K+1, B, D], got {tuple(trajectory.shape)}."
+        )
+    nodes = trajectory if include_endpoint else trajectory[:-1]
+    pooled = nodes.reshape(-1, nodes.shape[-1])  # [K*B, D], uniform in time
+
+    pooled = _subsample(pooled, n_points, generator)
+    target = _subsample(data, n_points, generator)
+    return sinkhorn_divergence(pooled, target, reg=reg, **kwargs)
+
+
+def cycle_consistency_loss(
     x0: torch.Tensor,
     x_cycle: torch.Tensor,
     reg: float = 0.05,
     **kwargs,
 ) -> torch.Tensor:
-    """Stationarity loss over one full cycle.
+    r"""Periodicity anchor: a subset returns to itself after one cycle.
 
-    Because the data distribution is invariant under the cyclic flow, the cloud
-    obtained by evolving ``x0`` over exactly one cycle should match ``x0`` in
-    distribution. This term is the Sinkhorn divergence between the initial cloud
-    and the once-around cloud.
+    Sinkhorn divergence between a subset ``x0`` and the *same* subset evolved
+    over exactly one full cycle ``x_cycle = \Phi_T(x0)``. Source and sink are
+    the same set of points, so minimising this term enforces that the flow
+    carries the subset once around and back to its own distribution in time
+    ``T`` (i.e. an integer number of loops; combined with the kinetic-energy
+    term this selects a single loop). This is the term referred to as
+    ``OT_sub``.
 
     Args:
-        x0: Initial coordinates ``[B, D]`` (the empirical stationary sample).
-        x_cycle: Coordinates after one full cycle ``[B, D]``.
+        x0: Subset start points ``[B, D]``.
+        x_cycle: The same subset after one full cycle ``[B, D]``.
         reg: Entropic regularisation strength.
         **kwargs: Forwarded to :func:`sinkhorn_divergence`.
 
     Returns:
         A scalar tensor.
     """
-    return sinkhorn_divergence(x0, x_cycle, reg=reg, **kwargs)
+    return sinkhorn_divergence(x_cycle, x0, reg=reg, **kwargs)
 
 
 def angular_alignment_loss(
@@ -194,30 +276,3 @@ def angular_alignment_loss(
         velocity.norm(dim=-1) * grad_theta.norm(dim=-1) + eps
     )
     return (1.0 - cos).mean()
-
-
-def subpopulation_ot_loss(
-    x_sub_evolved: torch.Tensor,
-    x_sub_target: torch.Tensor,
-    reg: float = 0.05,
-    **kwargs,
-) -> torch.Tensor:
-    r"""Temporal-anchor loss for a labelled sub-population.
-
-    Given starting points :math:`X_{sub}(0)` evolved under the learned field for
-    a physical time :math:`t'`, this term is the Sinkhorn divergence between the
-    model-evolved cloud and the known target cloud :math:`X_{sub}(t')`. It ties
-    the model's latent time to physical cycle time and thereby fixes the overall
-    *speed* (and phase) of the field, anchoring the flow so that its
-    time-integrated density reproduces the stationary data distribution.
-
-    Args:
-        x_sub_evolved: Model-evolved sub-population at ``t'`` ``[N_sub, D]``.
-        x_sub_target: Ground-truth targets at ``t'`` ``[M_sub, D]``.
-        reg: Entropic regularisation strength.
-        **kwargs: Forwarded to :func:`sinkhorn_divergence`.
-
-    Returns:
-        A scalar tensor.
-    """
-    return sinkhorn_divergence(x_sub_evolved, x_sub_target, reg=reg, **kwargs)

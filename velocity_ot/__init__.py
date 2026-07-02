@@ -14,14 +14,20 @@ Quick start
 
 from __future__ import annotations
 
-from . import circular_gradient, dynamics, losses, models, solver
+from . import circular_gradient, dynamics, losses, models, plotting, solver
 from .dynamics import IntegrationResult, ODEIntegrator, integrate
+from .plotting import (
+    integrate_trajectories,
+    plot_loss_history,
+    plot_trajectories,
+    plot_velocity_field,
+)
 from .losses import (
     angular_alignment_loss,
-    global_ot_loss,
+    cycle_consistency_loss,
     kinetic_energy_loss,
     sinkhorn_divergence,
-    subpopulation_ot_loss,
+    stationarity_loss,
 )
 from .models import ACTIVATION_FN, VelocityNet
 from .solver import VelocityFieldEstimator
@@ -41,9 +47,14 @@ __all__ = [
     # losses
     "sinkhorn_divergence",
     "kinetic_energy_loss",
-    "global_ot_loss",
+    "stationarity_loss",
     "angular_alignment_loss",
-    "subpopulation_ot_loss",
+    "cycle_consistency_loss",
+    # plotting
+    "integrate_trajectories",
+    "plot_velocity_field",
+    "plot_trajectories",
+    "plot_loss_history",
     # submodules
     "models",
     "dynamics",
