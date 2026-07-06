@@ -12,11 +12,13 @@
 
 from __future__ import annotations
 
+import copy
 from typing import Any, Sequence
 
 import numpy as np
 import torch
 
+from . import graph_ot
 from . import losses as L
 from .circular_gradient import estimate_gradient_field
 from .dynamics import ODEIntegrator
@@ -88,6 +90,25 @@ class VelocityFieldEstimator:
         intrinsic_dim: Intrinsic manifold dimension for the gradient estimate
             (e.g. ``1`` for a circle); ``None`` solves in the ambient space.
         bandwidth: Kernel bandwidth for the gradient estimate; ``None`` = auto.
+        n_components: If set, the input coordinates are reduced with PCA to this
+            many dimensions *before* fitting, and the velocity field is learned
+            in that PCA space. ``None`` fits directly in the input space. The
+            fitted PCA is stored and reused for plotting projections.
+        pca_whiten: Whether the fit-time PCA whitens components.
+        init: Run the graph-OT initialisation stage before fine-tuning (helps
+            learning in high dimensions). ``True`` by default.
+        init_epochs: Epochs for the initialisation stage.
+        lambda_init: Weight of the initialisation MSE ``||v(x) - u||^2``.
+        init_knn: Neighbours for the effective-resistance graph (defaults to
+            ``knn``).
+        init_reg: Entropic regularisation for the graph-OT transition plan.
+        init_angle_delta: Forward-step barrier width ``delta`` (radians);
+            auto-set from the graph when ``None``.
+        init_angle_weight: Weight of the angular barrier in the graph-OT cost
+            (``C + init_angle_weight * Phi``; negative reproduces ``C - Phi``).
+        init_phi_max: Wall value for forbidden/near-boundary angular steps.
+        init_max_cells: Subsample cap for the (dense) graph-OT computation; when
+            there are more cells, a random subset seeds the init targets.
         device: Torch device string; ``None`` picks CUDA when available.
         seed: Optional RNG seed for reproducibility.
         verbose: Whether to print progress during :meth:`fit`.
@@ -96,6 +117,8 @@ class VelocityFieldEstimator:
         model: The fitted :class:`~velocity_ot.models.VelocityNet` (after
             :meth:`fit`).
         history: Dict of per-epoch loss curves (after :meth:`fit`).
+        pca_: The fitted fit-time PCA (or ``None`` if ``n_components`` was unset).
+        fit_key_: ``obsm`` key holding the fit-space coordinates.
     """
 
     def __init__(
@@ -124,6 +147,17 @@ class VelocityFieldEstimator:
         knn: int = 10,
         intrinsic_dim: int | None = None,
         bandwidth: float | None = None,
+        n_components: int | None = None,
+        pca_whiten: bool = False,
+        init: bool = True,
+        init_epochs: int = 100,
+        lambda_init: float = 1.0,
+        init_knn: int | None = None,
+        init_reg: float = 0.05,
+        init_angle_delta: float | None = None,
+        init_angle_weight: float = 1.0,
+        init_phi_max: float = 50.0,
+        init_max_cells: int = 2000,
         device: str | None = None,
         seed: int | None = None,
         verbose: bool = True,
@@ -157,6 +191,18 @@ class VelocityFieldEstimator:
         self.knn = int(knn)
         self.intrinsic_dim = intrinsic_dim
         self.bandwidth = bandwidth
+        self.n_components = n_components
+        self.pca_whiten = bool(pca_whiten)
+
+        self.init = bool(init)
+        self.init_epochs = int(init_epochs)
+        self.lambda_init = float(lambda_init)
+        self.init_knn = init_knn
+        self.init_reg = float(init_reg)
+        self.init_angle_delta = init_angle_delta
+        self.init_angle_weight = float(init_angle_weight)
+        self.init_phi_max = float(init_phi_max)
+        self.init_max_cells = int(init_max_cells)
 
         self.device = torch.device(
             device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
@@ -166,7 +212,14 @@ class VelocityFieldEstimator:
 
         self.model: VelocityNet | None = None
         self.history: dict[str, list[float]] = {}
+        self.init_history: dict[str, list[float]] = {}
         self.dim_: int | None = None
+        self.best_epoch_: int | None = None
+        self.best_loss_: float | None = None
+        # Transforms saved at fit time and reused for plotting.
+        self.pca_ = None                 # fit-space PCA (raw -> fit space), or None
+        self.fit_key_: str | None = None  # obsm key holding the fit-space coords
+        self._plot_reducers: dict = {}    # cache of {(basis, k): fitted reducer}
 
     # ------------------------------------------------------------------ #
     #  Helpers
@@ -212,6 +265,70 @@ class VelocityFieldEstimator:
             return _to_2d_array(adata.obsm[value], name)
         return _to_2d_array(value, name)
 
+    def _reduce(self, X_raw: np.ndarray, pca=None):
+        """Reduce raw coordinates to the fit space via PCA.
+
+        Returns ``(X_fit, pca_or_None)``. If ``n_components`` is unset or not
+        smaller than the input dimension, no reduction is applied.
+        """
+        d = X_raw.shape[1]
+        if self.n_components is None or self.n_components >= d:
+            return X_raw.astype(np.float32), None
+        if pca is None:
+            from sklearn.decomposition import PCA
+
+            pca = PCA(
+                n_components=int(self.n_components),
+                whiten=self.pca_whiten,
+                random_state=self.seed if self.seed is not None else 0,
+            ).fit(X_raw)
+        return np.asarray(pca.transform(X_raw), dtype=np.float32), pca
+
+    def transform(self, X_raw: np.ndarray | torch.Tensor) -> np.ndarray:
+        """Map raw input coordinates into the fit space (applies the fit PCA)."""
+        X = _to_2d_array(
+            X_raw.detach().cpu().numpy() if isinstance(X_raw, torch.Tensor) else X_raw, "X"
+        )
+        if self.pca_ is None:
+            return X.astype(np.float32)
+        return np.asarray(self.pca_.transform(X), dtype=np.float32)
+
+    def fit_space_coords(self, adata, spatial_key: str | None = None) -> np.ndarray:
+        """Fit-space coordinates for ``adata`` (cached in ``obsm[fit_key_]``)."""
+        if self.fit_key_ is not None and self.fit_key_ in adata.obsm:
+            return _to_2d_array(adata.obsm[self.fit_key_], "fit_coords")
+        return self.transform(self._get_spatial(adata, spatial_key))
+
+    def plotting_reducer(self, basis: str, X_fit: np.ndarray, n_components: int = 2, reducer=None):
+        """Return (and cache) a fitted 2-/3-D reducer for projecting the fit space.
+
+        ``basis`` is ``"pca"`` or ``"umap"``. A pre-fitted ``reducer`` (anything
+        with ``.transform``) is used as-is; otherwise one is fitted on ``X_fit``
+        and cached on the estimator so repeated plots reuse it.
+        """
+        if reducer is not None:
+            return reducer
+        key = (basis, int(n_components))
+        if key in self._plot_reducers:
+            return self._plot_reducers[key]
+        rs = self.seed if self.seed is not None else 0
+        if basis == "pca":
+            from sklearn.decomposition import PCA
+
+            reducer = PCA(n_components=n_components, random_state=rs).fit(X_fit)
+        elif basis == "umap":
+            try:
+                import umap
+            except ImportError as e:  # pragma: no cover
+                raise ImportError(
+                    "basis='umap' requires the 'umap-learn' package (pip install umap-learn)."
+                ) from e
+            reducer = umap.UMAP(n_components=n_components, random_state=rs).fit(X_fit)
+        else:
+            raise ValueError(f"Unknown basis '{basis}'. Choose 'pca' or 'umap'.")
+        self._plot_reducers[key] = reducer
+        return reducer
+
     def _build_optimizer(self) -> torch.optim.Optimizer:
         assert self.model is not None
         opt_cls = {"adam": torch.optim.Adam, "adamw": torch.optim.AdamW}
@@ -228,6 +345,91 @@ class VelocityFieldEstimator:
             normalize_cost=self.normalize_cost,
         )
 
+    def _init_stage(
+        self,
+        X: torch.Tensor,
+        theta_np: np.ndarray,
+        integrator: ODEIntegrator,
+        sk: dict,
+        batch_size: int,
+        eff_res_fn=None,
+    ) -> np.ndarray:
+        """Graph-OT initialisation of the velocity network.
+
+        Builds displacement targets ``u`` from an entropic transition plan
+        (effective-resistance cost + angular barrier) and trains the network on
+        ``lambda_init * ||v(x) - u||^2 + lambda_ot_sub * OT_sub`` for
+        ``init_epochs``. Operates on a random subsample when there are more than
+        ``init_max_cells`` cells. Returns ``u`` (aligned to the subset used).
+        """
+        assert self.model is not None
+        n = X.shape[0]
+        knn = self.init_knn if self.init_knn is not None else self.knn
+
+        # Subsample for the dense graph-OT when necessary.
+        if n > self.init_max_cells:
+            gen = torch.Generator(device="cpu")
+            if self.seed is not None:
+                gen.manual_seed(self.seed)
+            sub = torch.randperm(n, generator=gen)[: self.init_max_cells]
+            idx_sub = sub.to(X.device)
+        else:
+            idx_sub = torch.arange(n, device=X.device)
+
+        X_sub = X[idx_sub]
+        theta_sub = theta_np[idx_sub.cpu().numpy()]
+
+        u_np, info = graph_ot.graph_ot_init_targets(
+            X_sub.detach().cpu().numpy(),
+            theta_sub,
+            knn=knn,
+            delta=self.init_angle_delta,
+            angle_weight=self.init_angle_weight,
+            reg=self.init_reg,
+            phi_max=self.init_phi_max,
+            eff_res_fn=eff_res_fn,
+        )
+        U = torch.as_tensor(u_np, device=X.device)
+
+        opt = self._build_optimizer()
+        m = X_sub.shape[0]
+        bs = min(batch_size, m)
+        self.init_history = {"total": [], "mse": [], "ot_sub": []}
+
+        self.model.train()
+        for epoch in range(self.init_epochs):
+            perm = torch.randperm(m, device=X.device)
+            stats = {k: 0.0 for k in self.init_history}
+            nb = 0
+            for start in range(0, m, bs):
+                b = perm[start : start + bs]
+                xb = X_sub[b]
+                loss_mse = ((self.model(xb) - U[b]) ** 2).sum(-1).mean()
+                # OT_sub keeps the flow periodic and prevents a degenerate field.
+                endpoint = integrator(xb, t_end=self.T).endpoint
+                loss_ot_sub = L.cycle_consistency_loss(xb, endpoint, **sk)
+                loss = self.lambda_init * loss_mse + self.lambda_ot_sub * loss_ot_sub
+
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+
+                stats["total"] += float(loss.detach())
+                stats["mse"] += float(loss_mse.detach())
+                stats["ot_sub"] += float(loss_ot_sub.detach())
+                nb += 1
+            for k in self.init_history:
+                self.init_history[k].append(stats[k] / max(nb, 1))
+            if self.verbose and (
+                epoch % max(1, self.init_epochs // 5) == 0 or epoch == self.init_epochs - 1
+            ):
+                h = {k: self.init_history[k][-1] for k in self.init_history}
+                print(
+                    f"[init  {epoch:4d}] total={h['total']:.4f}  "
+                    f"mse={h['mse']:.4f}  OT_sub={h['ot_sub']:.4f}  (delta={info['delta']:.3f})"
+                )
+        return u_np
+
     # ------------------------------------------------------------------ #
     #  Fitting
     # ------------------------------------------------------------------ #
@@ -241,6 +443,9 @@ class VelocityFieldEstimator:
         grad_theta_key: str | None = None,
         velocity_key: str = "velocity_field",
         grad_theta_out_key: str | None = "grad_theta",
+        pca=None,
+        fit_key: str = "X_velocity_fit",
+        eff_res_fn=None,
     ) -> "VelocityFieldEstimator":
         """Fit the velocity field to the data in ``adata``.
 
@@ -256,9 +461,19 @@ class VelocityFieldEstimator:
                 ``min(N, 256)``.
             grad_theta_key: If given, read a precomputed :math:`\\nabla\\theta`
                 field from ``adata.obsm`` instead of estimating it.
-            velocity_key: Output key in ``adata.obsm`` for fitted velocities.
+            velocity_key: Output key in ``adata.obsm`` for fitted velocities
+                (in the fit space).
             grad_theta_out_key: If not ``None``, also store the (estimated or
                 supplied) :math:`\\nabla\\theta` field under this ``obsm`` key.
+            pca: Optional pre-fitted PCA (any object with ``.transform``) to load
+                instead of fitting a new one; only used when ``n_components`` is
+                set. Handy for reusing a cached reducer across runs.
+            fit_key: ``obsm`` key under which the fit-space coordinates are saved
+                (reused by the plotting projections).
+            eff_res_fn: Effective-resistance source for the init stage: a
+                precomputed ``[N, N]`` cost matrix, a callable ``fn(X, knn)``
+                (e.g. ``dist_utils.get_eff_res``), or ``None`` (use
+                ``dist_utils.get_eff_res`` if importable, else the built-in).
 
         Returns:
             ``self``, with :attr:`model` and :attr:`history` populated, and the
@@ -269,13 +484,20 @@ class VelocityFieldEstimator:
             np.random.seed(self.seed)
 
         # ---- 1. extract data -------------------------------------------------
-        X_np = self._get_spatial(adata, spatial_key)
+        X_raw = self._get_spatial(adata, spatial_key)
         theta_np = self._get_theta(adata, theta_key)
-        n, d = X_np.shape
+        n = X_raw.shape[0]
         if theta_np.shape[0] != n:
             raise ValueError(
                 f"theta has {theta_np.shape[0]} entries but there are {n} points."
             )
+
+        # ---- 1b. optional PCA reduction into the fit space -------------------
+        X_np, self.pca_ = self._reduce(X_raw, pca)
+        self.fit_key_ = fit_key
+        adata.obsm[fit_key] = X_np
+        self._plot_reducers = {}  # invalidate any cached plotting reducers
+        d = X_np.shape[1]
         self.dim_ = d
 
         # ---- 2. circular-coordinate gradient (fixed target for alignment) ----
@@ -307,11 +529,20 @@ class VelocityFieldEstimator:
             residual=self.residual,
         ).to(self.device)
         integrator = ODEIntegrator(self.model, method=self.method, n_steps=self.n_steps, T=self.T)
-        opt = self._build_optimizer()
         sk = self._sinkhorn_kwargs()
 
         if batch_size is None:
             batch_size = min(n, 256)
+
+        # ---- 3b. graph-OT initialisation stage -------------------------------
+        self.init_history = {}
+        if self.init and self.init_epochs > 0:
+            self._init_stage(X, theta_np, integrator, sk, batch_size, eff_res_fn=eff_res_fn)
+            adata.obsm["velocity_init"] = self.predict(X_np)
+            self.model.train()
+
+        # Fresh optimiser for the fine-tuning stage (init used its own).
+        opt = self._build_optimizer()
 
         # Localized seed for the stationarity term: a contiguous arc in the
         # circular coordinate (a clump that must flow around to reproduce data).
@@ -320,7 +551,10 @@ class VelocityFieldEstimator:
 
         self.history = {"total": [], "ke": [], "stationarity": [], "align": [], "ot_sub": []}
 
-        # ---- 4. training loop ------------------------------------------------
+        # ---- 4. training loop (fine-tuning) ----------------------------------
+        best_state = None
+        self.best_loss_ = float("inf")
+        self.best_epoch_ = None
         self.model.train()
         for epoch in range(n_epochs):
             perm = torch.randperm(n, device=self.device)
@@ -346,11 +580,14 @@ class VelocityFieldEstimator:
                 s = int(torch.randint(0, n, (1,)).item())
                 arc = theta_order[(s + torch.arange(seed_w, device=self.device)) % n]
                 x_seed = X[arc]
+                
                 if self.stationarity_burnin_loops > 0:
                     with torch.no_grad():
                         x_seed = integrator(
-                            x_seed, t_end=self.stationarity_burnin_loops * self.T
+                            x_seed, t_end=(epoch//10 + 1) * self.T
                         ).endpoint
+
+
                 loc_result = integrator(x_seed, t_end=self.stationarity_sample_loops * self.T)
                 loss_stationarity = L.stationarity_loss(
                     loc_result.trajectory, X, n_points=self.stationarity_n_points, **sk
@@ -377,6 +614,15 @@ class VelocityFieldEstimator:
             for k in self.history:
                 self.history[k].append(epoch_stats[k] / max(n_batches, 1))
 
+            # Track the best (lowest mean total loss) model, not the last one.
+            epoch_total = self.history["total"][-1]
+            if epoch_total < self.best_loss_:
+                self.best_loss_ = float(epoch_total)
+                self.best_epoch_ = int(epoch)
+                best_state = {
+                    k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()
+                }
+
             if self.verbose and (epoch % max(1, n_epochs // 10) == 0 or epoch == n_epochs - 1):
                 h = {k: self.history[k][-1] for k in self.history}
                 print(
@@ -385,12 +631,21 @@ class VelocityFieldEstimator:
                     f"align={h['align']:.4f}  OT_sub={h['ot_sub']:.4f}"
                 )
 
+        # Restore the best-loss weights (rather than keeping the last epoch).
+        if best_state is not None:
+            self.model.load_state_dict(best_state)
+            if self.verbose:
+                print(f"[best] restored epoch {self.best_epoch_} (total={self.best_loss_:.4f})")
+
         # ---- 5. write outputs back to AnnData --------------------------------
         adata.obsm[velocity_key] = self.predict(X_np)
         if grad_theta_out_key is not None:
             adata.obsm[grad_theta_out_key] = grad_np
         adata.uns["velocity_ot"] = {
             "history": {k: list(v) for k, v in self.history.items()},
+            "init_history": {k: list(v) for k, v in self.init_history.items()},
+            "best_epoch": self.best_epoch_,
+            "best_loss": self.best_loss_,
             "config": {
                 "hidden_dims": list(self.hidden_dims),
                 "activation": self.activation,
@@ -404,6 +659,9 @@ class VelocityFieldEstimator:
                     "ot_sub": self.lambda_ot_sub,
                 },
                 "sinkhorn_reg": self.sinkhorn_reg,
+                "n_components": self.n_components,
+                "fit_key": self.fit_key_,
+                "fit_dim": self.dim_,
             },
         }
         return self

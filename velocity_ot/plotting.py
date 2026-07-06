@@ -38,6 +38,7 @@ __all__ = [
     "integrate_trajectories",
     "plot_velocity_field",
     "plot_trajectories",
+    "plot_trajectories_embedding",
     "plot_loss_history",
 ]
 
@@ -335,6 +336,158 @@ def plot_trajectories(
 
 
 # --------------------------------------------------------------------------- #
+#  Trajectories projected into a 2-D / 3-D embedding
+# --------------------------------------------------------------------------- #
+def _scatter_background(ax, emb, adata, color, is3d):
+    """Scatter the embedded data, optionally coloured by an ``obs`` column."""
+    coords = [emb[:, i] for i in range(emb.shape[1])]
+    if color is None or color not in getattr(adata, "obs", {}):
+        ax.scatter(*coords, s=8, c="0.8", alpha=0.5, linewidths=0, zorder=1)
+        return
+    series = adata.obs[color]
+    values = np.asarray(series)
+    if series.dtype.kind in "biufc":  # numeric -> continuous colormap
+        sc = ax.scatter(*coords, c=values, s=10, cmap="twilight", alpha=0.7,
+                        linewidths=0, zorder=1)
+        ax.figure.colorbar(sc, ax=ax, fraction=0.04, pad=0.02, label=color)
+    else:  # categorical -> discrete colours + legend
+        cats = list(dict.fromkeys(values))
+        cmap = plt.get_cmap("tab10" if len(cats) <= 10 else "tab20")
+        for i, c in enumerate(cats):
+            m = values == c
+            pts = [emb[m, j] for j in range(emb.shape[1])]
+            ax.scatter(*pts, s=10, color=cmap(i % cmap.N), alpha=0.7,
+                       linewidths=0, zorder=1, label=str(c))
+        ax.legend(loc="best", frameon=False, fontsize=8, markerscale=1.5)
+
+
+def plot_trajectories_embedding(
+    est,
+    adata,
+    basis: str = "umap",
+    n_components: int = 2,
+    reducer: Any = None,
+    spatial_key: str | None = None,
+    seeds: np.ndarray | None = None,
+    n_seeds: int = 30,
+    T: float = 1.0,
+    n_steps: int = 120,
+    method: str = "rk4",
+    color: str | None = None,
+    smooth: bool = False,
+    cmap: str = "viridis",
+    linewidth: float = 1.3,
+    alpha: float = 0.9,
+    ax: Any = None,
+    seed: int | None = 0,
+    title: str | None = None,
+) -> Any:
+    """Integrate trajectories in the fit space and plot them in a 2-/3-D embedding.
+
+    Trajectories are always integrated in the space the field was trained on
+    (the PCA fit space of ``est``), then projected down for display with the
+    transforms saved at fit time (or a supplied ``reducer``). Use this to check
+    the circular structure of the learned dynamics qualitatively.
+
+    Args:
+        est: A fitted :class:`velocity_ot.VelocityFieldEstimator`.
+        adata: The :class:`anndata.AnnData` used for fitting (for the background
+            cloud and optional colouring).
+        basis: Projection for display, ``"umap"`` or ``"pca"``.
+        n_components: ``2`` or ``3`` (2-D or 3-D plot).
+        reducer: Optional pre-fitted reducer (anything with ``.transform``) to
+            reuse instead of fitting/caching one.
+        spatial_key: Passed through to recover fit-space coordinates if they are
+            not already cached on ``adata``.
+        seeds: Optional seed points in **fit space** ``[m, D_fit]``; if ``None``,
+            ``n_seeds`` points are sampled from the data.
+        n_seeds: Number of seeds when ``seeds`` is ``None``.
+        T, n_steps, method: Integration horizon, step count and scheme.
+        color: Optional ``adata.obs`` column to colour the background cloud by
+            (e.g. ``"cluster"``); numeric → colourbar, categorical → legend.
+        smooth: Cubic-spline smoothing of each projected trajectory (needs SciPy).
+        cmap: Colormap encoding time along trajectories.
+        linewidth, alpha: Trajectory line style.
+        ax: Existing axes; a new (3-D when ``n_components==3``) figure is made if
+            ``None``.
+        seed: RNG seed for seed-point sampling.
+        title: Axes title (defaults to a description of the projection).
+
+    Returns:
+        The matplotlib axes.
+    """
+    if n_components not in (2, 3):
+        raise ValueError("n_components must be 2 or 3.")
+    if getattr(est, "model", None) is None:
+        raise RuntimeError("Call est.fit(...) before plotting.")
+
+    rng = np.random.default_rng(seed)
+    X_fit = est.fit_space_coords(adata, spatial_key)
+    reducer = est.plotting_reducer(basis, X_fit, n_components, reducer)
+    X_emb = np.asarray(reducer.transform(X_fit))
+
+    seed_pts = (
+        np.asarray(seeds, dtype=np.float32)
+        if seeds is not None
+        else X_fit[rng.choice(X_fit.shape[0], size=min(n_seeds, X_fit.shape[0]), replace=False)]
+    )
+    traj, times = integrate_trajectories(est, seed_pts, T=T, n_steps=n_steps, method=method)
+    K1, n_traj, D = traj.shape
+    traj_emb = np.asarray(reducer.transform(traj.reshape(-1, D))).reshape(K1, n_traj, n_components)
+
+    is3d = n_components == 3
+    if ax is None:
+        _apply_style()
+        fig = plt.figure(figsize=(7.5, 6.5), dpi=110)
+        ax = fig.add_subplot(111, projection="3d") if is3d else fig.add_subplot(111)
+
+    _scatter_background(ax, X_emb, adata, color, is3d)
+
+    norm = plt.Normalize(times.min(), times.max())
+    colormap = plt.get_cmap(cmap)
+    seg_t = 0.5 * (times[:-1] + times[1:])
+    if is3d:
+        from mpl_toolkits.mplot3d.art3d import Line3DCollection
+
+    for p in range(n_traj):
+        curve = traj_emb[:, p, :]
+        ts = times
+        if smooth and _HAVE_SCIPY and K1 >= 4:
+            t_old = np.linspace(0.0, 1.0, K1)
+            t_new = np.linspace(0.0, 1.0, 300)
+            curve = np.stack(
+                [make_interp_spline(t_old, curve[:, k], k=3)(t_new) for k in range(n_components)],
+                axis=1,
+            )
+            ts = np.linspace(times.min(), times.max(), 300)
+        pts = curve.reshape(-1, 1, n_components)
+        segments = np.concatenate([pts[:-1], pts[1:]], axis=1)
+        arr = 0.5 * (ts[:-1] + ts[1:])
+        lc = (Line3DCollection(segments) if is3d else LineCollection(segments))
+        lc.set_cmap(colormap); lc.set_norm(norm); lc.set_array(arr)
+        lc.set_linewidth(linewidth); lc.set_alpha(alpha); lc.set_zorder(2)
+        ax.add_collection(lc)
+
+    start, end = traj_emb[0], traj_emb[-1]
+    ax.scatter(*[start[:, i] for i in range(n_components)], s=26, facecolors="none",
+               edgecolors="black", linewidths=0.8, zorder=4, label="start")
+    ax.scatter(*[end[:, i] for i in range(n_components)], s=42, marker="*",
+               c="black", zorder=4, label="end")
+
+    sm = plt.cm.ScalarMappable(cmap=colormap, norm=norm); sm.set_array([])
+    ax.figure.colorbar(sm, ax=ax, fraction=0.04, pad=0.02, label="time")
+
+    ax.set_xlabel(f"{basis.upper()} 1"); ax.set_ylabel(f"{basis.upper()} 2")
+    if is3d:
+        ax.set_zlabel(f"{basis.upper()} 3")
+    else:
+        ax.set_aspect("equal", adjustable="datalim"); ax.autoscale_view()
+    ax.set_title(title if title is not None else
+                 f"integrated trajectories ({basis.upper()}, {n_components}D)")
+    return ax
+
+
+# --------------------------------------------------------------------------- #
 #  Loss curves
 # --------------------------------------------------------------------------- #
 def plot_loss_history(
@@ -368,6 +521,9 @@ def plot_loss_history(
         _, ax = plt.subplots(figsize=(7, 4.5), dpi=110)
 
     for name, values in curves.items():
+        # Do not show KE loss
+        if name == "ke":
+            continue
         values = np.asarray(values, dtype=float)
         ax.plot(np.arange(len(values)), values, label=name, linewidth=1.6)
 

@@ -14,12 +14,14 @@ Quick start
 
 from __future__ import annotations
 
-from . import circular_gradient, dynamics, losses, models, plotting, solver
+from . import circular_gradient, dynamics, graph_ot, losses, models, plotting, solver
 from .dynamics import IntegrationResult, ODEIntegrator, integrate
+from .graph_ot import effective_resistance, graph_ot_init_targets
 from .plotting import (
     integrate_trajectories,
     plot_loss_history,
     plot_trajectories,
+    plot_trajectories_embedding,
     plot_velocity_field,
 )
 from .losses import (
@@ -54,11 +56,16 @@ __all__ = [
     "integrate_trajectories",
     "plot_velocity_field",
     "plot_trajectories",
+    "plot_trajectories_embedding",
     "plot_loss_history",
+    # graph-OT initialisation
+    "graph_ot_init_targets",
+    "effective_resistance",
     # submodules
     "models",
     "dynamics",
     "losses",
     "solver",
     "circular_gradient",
+    "graph_ot",
 ]
