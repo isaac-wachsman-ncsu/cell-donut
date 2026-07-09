@@ -183,3 +183,61 @@ class ODEIntegrator:
             n_steps=n_steps,
             method=self.method,
         )
+
+
+
+@torch.no_grad()
+def evaluate_velocity_field_drift(
+    estimator, 
+    adata, 
+    n_cycles: int = 3, 
+    subset_size: int = 500
+) -> float:
+    """Evaluates a trained VelocityNet post-training by tracking coordinate drift.
+    
+    It evolves points over a known, fixed integer multiple of the cycle period 
+    (T = 1.0) and calculates the Sum of Squared Errors (SSE) between their 
+    initial and final positions.
+    
+    Args:
+        estimator: The fitted VelocityFieldEstimator orchestrator instance.
+        adata: The AnnData object containing the data coordinates.
+        n_cycles: Integer multiple of loops to evolve the points over (e.g., 3, 5).
+        subset_size: Number of random cells to evaluate for tracking drift.
+        
+    Returns:
+        total_sse: Sum of squared magnitudes of (original_coords - evolved_coords).
+    """
+    # 1. Extract coordinates from the space the model was trained on
+    X_fit = estimator.fit_space_coords(adata)
+    X_tensor = torch.as_tensor(X_fit, device=estimator.device, dtype=torch.float32)
+    N = X_tensor.shape[0]
+    
+    # 2. Grab a random subset of data to track
+    if N > subset_size:
+        idx = torch.randperm(N)[:subset_size]
+        x0 = X_tensor[idx]
+    else:
+        x0 = X_tensor
+    
+    # 3. Calculate total evolution time and integration steps
+    total_eval_time = float(n_cycles * 1.0)
+    eval_steps = int(n_cycles * estimator.n_steps)
+    
+    # 4. Instantiate the library's fixed-step ODE integrator
+    eval_integrator = ODEIntegrator(
+        velocity=estimator.model,
+        method=estimator.method,
+        n_steps=eval_steps,
+        T=total_eval_time
+    )
+    
+    # 5. Integrate the points forward through time
+    eval_res = eval_integrator(x0, t_end=total_eval_time)
+    x_evolved = eval_res.endpoint
+    
+    # 6. Calculate the Sum of Squared Errors (SSE)
+    squared_diffs = (x0 - x_evolved) ** 2
+    total_sse = torch.sum(squared_diffs).cpu().item()
+    
+    return float(total_sse)
