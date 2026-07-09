@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import dataclass
 from typing import Any, Sequence
 
 import numpy as np
@@ -25,6 +26,57 @@ from .dynamics import ODEIntegrator
 from .models import VelocityNet
 
 ArrayLike = np.ndarray | torch.Tensor | str
+
+
+@dataclass
+class Stage:
+    """One training stage: which losses are active, how strongly, and for how long.
+
+    Any weight left as ``None`` inherits the estimator's corresponding
+    ``lambda_*``; ``lr=None`` inherits the estimator's ``lr``. A loss whose
+    resolved weight is ``0`` is skipped entirely (so an align-only stage does no
+    ODE integration or Sinkhorn, making it fast).
+
+    Attributes:
+        name: Label shown in the progress bar / logs.
+        epochs: Number of epochs for this stage.
+        lr: Learning rate for this stage (``None`` -> estimator ``lr``).
+        lambda_ke, lambda_stationarity, lambda_align, lambda_ot_sub: Per-stage
+            loss weights (``None`` -> the estimator's value).
+    """
+
+    name: str = "train"
+    epochs: int = 100
+    lr: float | None = None
+    lambda_ke: float | None = None
+    lambda_stationarity: float | None = None
+    lambda_align: float | None = None
+    lambda_ot_sub: float | None = None
+
+
+def load_stages(spec) -> list[Stage] | None:
+    """Normalise a stage spec into a ``list[Stage]`` (or ``None``).
+
+    ``spec`` may be ``None`` (single default stage), a list of :class:`Stage`
+    or dicts, or a path to a YAML file with a top-level ``stages:`` list.
+    """
+    if spec is None:
+        return None
+    if isinstance(spec, str):
+        import yaml
+
+        with open(spec) as f:
+            doc = yaml.safe_load(f)
+        spec = doc["stages"] if isinstance(doc, dict) and "stages" in doc else doc
+    stages = []
+    for s in spec:
+        if isinstance(s, Stage):
+            stages.append(s)
+        elif isinstance(s, dict):
+            stages.append(Stage(**s))
+        else:
+            raise TypeError(f"Each stage must be a Stage or dict, got {type(s)}.")
+    return stages
 
 
 def _to_2d_array(value: np.ndarray | torch.Tensor, name: str) -> np.ndarray:
@@ -213,6 +265,7 @@ class VelocityFieldEstimator:
         self.model: VelocityNet | None = None
         self.history: dict[str, list[float]] = {}
         self.init_history: dict[str, list[float]] = {}
+        self.stage_history_: list = []
         self.dim_: int | None = None
         self.best_epoch_: int | None = None
         self.best_loss_: float | None = None
@@ -329,13 +382,15 @@ class VelocityFieldEstimator:
         self._plot_reducers[key] = reducer
         return reducer
 
-    def _build_optimizer(self) -> torch.optim.Optimizer:
+    def _build_optimizer(self, lr: float | None = None) -> torch.optim.Optimizer:
         assert self.model is not None
         opt_cls = {"adam": torch.optim.Adam, "adamw": torch.optim.AdamW}
         if self.optimizer not in opt_cls:
             raise ValueError(f"Unknown optimizer '{self.optimizer}'.")
         return opt_cls[self.optimizer](
-            self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay
+            self.model.parameters(),
+            lr=self.lr if lr is None else lr,
+            weight_decay=self.weight_decay,
         )
 
     def _sinkhorn_kwargs(self) -> dict[str, Any]:
@@ -430,6 +485,103 @@ class VelocityFieldEstimator:
                 )
         return u_np
 
+    def _progress(self, n_epochs: int, desc: str):
+        """Return a progress iterator over epochs (tqdm bar if available)."""
+        if not self.verbose:
+            return range(n_epochs)
+        try:
+            from tqdm.auto import tqdm
+
+            return tqdm(range(n_epochs), desc=desc, leave=True)
+        except Exception:  # pragma: no cover
+            return range(n_epochs)
+
+    def _run_stage(self, stage, X, G, theta_order, seed_w, integrator, sk, n, batch_size):
+        """Run one training stage; return ``(history, best_info)``.
+
+        Only the losses with non-zero (resolved) weight are computed, so a stage
+        that activates a subset of terms is correspondingly cheaper. Tracks the
+        lowest-total-loss weights within the stage and restores them at the end.
+        """
+        w_ke = self.lambda_ke if stage.lambda_ke is None else stage.lambda_ke
+        w_stat = self.lambda_stationarity if stage.lambda_stationarity is None else stage.lambda_stationarity
+        w_align = self.lambda_align if stage.lambda_align is None else stage.lambda_align
+        w_sub = self.lambda_ot_sub if stage.lambda_ot_sub is None else stage.lambda_ot_sub
+        lr = self.lr if stage.lr is None else stage.lr
+        need_traj = (w_ke > 0.0) or (w_sub > 0.0)  # the [0, T] rollout
+
+        opt = self._build_optimizer(lr=lr)
+        hist = {k: [] for k in ("total", "ke", "stationarity", "align", "ot_sub")}
+        best_state, best_loss, best_epoch = None, float("inf"), None
+
+        bar = self._progress(stage.epochs, f"[{stage.name}]")
+        use_bar = hasattr(bar, "set_postfix")
+        self.model.train()
+        for epoch in bar:
+            perm = torch.randperm(n, device=self.device)
+            es = {k: 0.0 for k in hist}
+            nb = 0
+            for start in range(0, n, batch_size):
+                idx = perm[start : start + batch_size]
+                x0 = X[idx]
+                zero = torch.zeros((), device=self.device)
+                l_ke = l_stat = l_align = l_sub = zero
+
+                if need_traj:
+                    result = integrator(x0, t_end=self.T)
+                    if w_ke > 0.0:
+                        l_ke = L.kinetic_energy_loss(result.velocities, result.dt)
+                    if w_sub > 0.0:
+                        l_sub = L.cycle_consistency_loss(x0, result.endpoint, **sk)
+                if w_align > 0.0:
+                    l_align = L.angular_alignment_loss(self.model(x0), G[idx])
+                if w_stat > 0.0:
+                    # Flow a localized arc onto the attractor (burn-in, no grad),
+                    # then match a short grad-carrying sampling rollout to data.
+                    s = int(torch.randint(0, n, (1,)).item())
+                    arc = theta_order[(s + torch.arange(seed_w, device=self.device)) % n]
+                    x_seed = X[arc]
+                    if self.stationarity_burnin_loops > 0:
+                        with torch.no_grad():
+                            x_seed = integrator(x_seed, t_end=(epoch // 10 + 1) * self.T).endpoint
+                    loc = integrator(x_seed, t_end=self.stationarity_sample_loops * self.T)
+                    l_stat = L.stationarity_loss(
+                        loc.trajectory, X, n_points=self.stationarity_n_points, **sk
+                    )
+
+                loss = w_ke * l_ke + w_stat * l_stat + w_align * l_align + w_sub * l_sub
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+
+                es["total"] += float(loss.detach())
+                es["ke"] += float(l_ke.detach())
+                es["stationarity"] += float(l_stat.detach())
+                es["align"] += float(l_align.detach())
+                es["ot_sub"] += float(l_sub.detach())
+                nb += 1
+
+            for k in hist:
+                hist[k].append(es[k] / max(nb, 1))
+            if hist["total"][-1] < best_loss:
+                best_loss = float(hist["total"][-1])
+                best_epoch = int(epoch)
+                best_state = {k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()}
+
+            if use_bar:
+                active = {"tot": hist["total"][-1]}
+                if w_ke > 0: active["ke"] = hist["ke"][-1]
+                if w_stat > 0: active["stat"] = hist["stationarity"][-1]
+                if w_align > 0: active["align"] = hist["align"][-1]
+                if w_sub > 0: active["sub"] = hist["ot_sub"][-1]
+                bar.set_postfix({k: f"{v:.3f}" for k, v in active.items()})
+
+        if best_state is not None:
+            self.model.load_state_dict(best_state)
+        return hist, {"best_epoch": best_epoch, "best_loss": best_loss,
+                      "weights": {"ke": w_ke, "stationarity": w_stat,
+                                  "align": w_align, "ot_sub": w_sub}, "lr": lr}
+
     # ------------------------------------------------------------------ #
     #  Fitting
     # ------------------------------------------------------------------ #
@@ -440,6 +592,7 @@ class VelocityFieldEstimator:
         theta_key: str = "circular_coords",
         n_epochs: int = 200,
         batch_size: int | None = None,
+        stages=None,
         grad_theta_key: str | None = None,
         velocity_key: str = "velocity_field",
         grad_theta_out_key: str | None = "grad_theta",
@@ -456,9 +609,15 @@ class VelocityFieldEstimator:
             theta_key: Name of the circular coordinate (radians). Read from
                 ``adata.obs`` first, then ``adata.obsm``. Defaults to
                 ``"circular_coords"`` (i.e. ``adata.obs['circular_coords']``).
-            n_epochs: Number of training epochs (full shuffled passes).
+            n_epochs: Epochs for the default single stage (used only when
+                ``stages`` is ``None``).
             batch_size: Mini-batch size for the OT terms. ``None`` uses
                 ``min(N, 256)``.
+            stages: Staged-training spec — ``None`` (one default stage using the
+                estimator's ``lambda_*``/``lr`` for ``n_epochs``), a list of
+                :class:`Stage`/dicts, or a path to a YAML file with a top-level
+                ``stages:`` list. Each stage sets its own active losses, weights,
+                learning rate and epochs, and runs in order.
             grad_theta_key: If given, read a precomputed :math:`\\nabla\\theta`
                 field from ``adata.obsm`` instead of estimating it.
             velocity_key: Output key in ``adata.obsm`` for fitted velocities
@@ -541,101 +700,44 @@ class VelocityFieldEstimator:
             adata.obsm["velocity_init"] = self.predict(X_np)
             self.model.train()
 
-        # Fresh optimiser for the fine-tuning stage (init used its own).
-        opt = self._build_optimizer()
-
         # Localized seed for the stationarity term: a contiguous arc in the
         # circular coordinate (a clump that must flow around to reproduce data).
         theta_order = torch.as_tensor(np.argsort(theta_np), device=self.device)
         seed_w = max(8, min(n, int(round(self.stationarity_seed_frac * n))))
 
+        # ---- 4. staged training ----------------------------------------------
+        stage_list = load_stages(stages)
+        if stage_list is None:  # backward-compatible single stage
+            stage_list = [Stage(name="train", epochs=n_epochs)]
+
         self.history = {"total": [], "ke": [], "stationarity": [], "align": [], "ot_sub": []}
-
-        # ---- 4. training loop (fine-tuning) ----------------------------------
-        best_state = None
-        self.best_loss_ = float("inf")
+        self.stage_history_ = []
+        self.best_loss_ = None
         self.best_epoch_ = None
-        self.model.train()
-        for epoch in range(n_epochs):
-            perm = torch.randperm(n, device=self.device)
-            epoch_stats = {k: 0.0 for k in self.history}
-            n_batches = 0
-
-            for start in range(0, n, batch_size):
-                idx = perm[start : start + batch_size]
-                x0 = X[idx]
-                g0 = G[idx]
-
-                # One integration over [0, T] feeds KE, alignment and OT_sub.
-                result = integrator(x0, t_end=self.T)
-
-                loss_ke = L.kinetic_energy_loss(result.velocities, result.dt)
-                loss_align = L.angular_alignment_loss(self.model(x0), g0)
-                loss_ot_sub = L.cycle_consistency_loss(x0, result.endpoint, **sk)
-
-                # Stationarity: flow a localized arc onto the attractor (burn-in,
-                # no grad) so the pooled marginal reflects the true limit-cycle
-                # distribution, then match a short grad-carrying sampling rollout
-                # to the full data.
-                s = int(torch.randint(0, n, (1,)).item())
-                arc = theta_order[(s + torch.arange(seed_w, device=self.device)) % n]
-                x_seed = X[arc]
-                
-                if self.stationarity_burnin_loops > 0:
-                    with torch.no_grad():
-                        x_seed = integrator(
-                            x_seed, t_end=(epoch//10 + 1) * self.T
-                        ).endpoint
-
-
-                loc_result = integrator(x_seed, t_end=self.stationarity_sample_loops * self.T)
-                loss_stationarity = L.stationarity_loss(
-                    loc_result.trajectory, X, n_points=self.stationarity_n_points, **sk
-                )
-
-                loss = (
-                    self.lambda_ke * loss_ke
-                    + self.lambda_stationarity * loss_stationarity
-                    + self.lambda_align * loss_align
-                    + self.lambda_ot_sub * loss_ot_sub
-                )
-
-                opt.zero_grad()
-                loss.backward()
-                opt.step()
-
-                epoch_stats["total"] += float(loss.detach())
-                epoch_stats["ke"] += float(loss_ke.detach())
-                epoch_stats["stationarity"] += float(loss_stationarity.detach())
-                epoch_stats["align"] += float(loss_align.detach())
-                epoch_stats["ot_sub"] += float(loss_ot_sub.detach())
-                n_batches += 1
-
+        offset = 0
+        for stage in stage_list:
+            if stage.epochs <= 0:
+                continue
+            hist, binfo = self._run_stage(
+                stage, X, G, theta_order, seed_w, integrator, sk, n, batch_size
+            )
             for k in self.history:
-                self.history[k].append(epoch_stats[k] / max(n_batches, 1))
-
-            # Track the best (lowest mean total loss) model, not the last one.
-            epoch_total = self.history["total"][-1]
-            if epoch_total < self.best_loss_:
-                self.best_loss_ = float(epoch_total)
-                self.best_epoch_ = int(epoch)
-                best_state = {
-                    k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()
-                }
-
-            if self.verbose and (epoch % max(1, n_epochs // 10) == 0 or epoch == n_epochs - 1):
-                h = {k: self.history[k][-1] for k in self.history}
-                print(
-                    f"[epoch {epoch:4d}] total={h['total']:.4f}  "
-                    f"KE={h['ke']:.4f}  stationarity={h['stationarity']:.4f}  "
-                    f"align={h['align']:.4f}  OT_sub={h['ot_sub']:.4f}"
-                )
-
-        # Restore the best-loss weights (rather than keeping the last epoch).
-        if best_state is not None:
-            self.model.load_state_dict(best_state)
+                self.history[k].extend(hist[k])
+            binfo["name"] = stage.name
+            binfo["epochs"] = stage.epochs
+            binfo["global_best_epoch"] = (
+                offset + binfo["best_epoch"] if binfo["best_epoch"] is not None else None
+            )
+            self.stage_history_.append(binfo)
+            offset += stage.epochs
+            # Final returned model = best of the last stage that ran.
+            self.best_loss_ = binfo["best_loss"]
+            self.best_epoch_ = binfo["global_best_epoch"]
             if self.verbose:
-                print(f"[best] restored epoch {self.best_epoch_} (total={self.best_loss_:.4f})")
+                print(
+                    f"[{stage.name}] best epoch {binfo['best_epoch']} "
+                    f"(total={binfo['best_loss']:.4f}) restored"
+                )
 
         # ---- 5. write outputs back to AnnData --------------------------------
         adata.obsm[velocity_key] = self.predict(X_np)
@@ -644,6 +746,7 @@ class VelocityFieldEstimator:
         adata.uns["velocity_ot"] = {
             "history": {k: list(v) for k, v in self.history.items()},
             "init_history": {k: list(v) for k, v in self.init_history.items()},
+            "stages": self.stage_history_,
             "best_epoch": self.best_epoch_,
             "best_loss": self.best_loss_,
             "config": {

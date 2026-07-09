@@ -32,13 +32,15 @@ from .losses import (
     stationarity_loss,
 )
 from .models import ACTIVATION_FN, VelocityNet
-from .solver import VelocityFieldEstimator
+from .solver import Stage, VelocityFieldEstimator, load_stages
 
 __version__ = "0.1.0"
 
 __all__ = [
     # high-level API
     "VelocityFieldEstimator",
+    "Stage",
+    "load_stages",
     # models
     "VelocityNet",
     "ACTIVATION_FN",
