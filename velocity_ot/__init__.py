@@ -15,7 +15,7 @@ Quick start
 from __future__ import annotations
 
 from . import circular_gradient, dynamics, graph_ot, losses, models, plotting, solver
-from .dynamics import IntegrationResult, ODEIntegrator, integrate
+from .dynamics import IntegrationResult, ODEIntegrator, integrate, evaluate_velocity_field_drift
 from .graph_ot import effective_resistance, graph_ot_init_targets
 from .plotting import (
     integrate_trajectories,
@@ -48,6 +48,7 @@ __all__ = [
     "integrate",
     "ODEIntegrator",
     "IntegrationResult",
+    "evaluate_velocity_field_drift",
     # losses
     "sinkhorn_divergence",
     "kinetic_energy_loss",
