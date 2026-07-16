@@ -14,9 +14,10 @@ Quick start
 
 from __future__ import annotations
 
-from . import circular_gradient, dynamics, graph_ot, losses, models, plotting, solver
+from . import circular_gradient, dynamics, graph_ot, losses, manifold, models, plotting, solver
 from .dynamics import IntegrationResult, ODEIntegrator, integrate
 from .graph_ot import effective_resistance, graph_ot_init_targets
+from .manifold import LimitCycle, estimate_limit_cycle
 from .plotting import (
     integrate_trajectories,
     plot_loss_history,
@@ -63,6 +64,9 @@ __all__ = [
     # graph-OT initialisation
     "graph_ot_init_targets",
     "effective_resistance",
+    # limit-cycle manifold
+    "estimate_limit_cycle",
+    "LimitCycle",
     # submodules
     "models",
     "dynamics",
@@ -70,4 +74,5 @@ __all__ = [
     "solver",
     "circular_gradient",
     "graph_ot",
+    "manifold",
 ]

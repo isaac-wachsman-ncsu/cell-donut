@@ -152,6 +152,7 @@ def stationarity_loss(
     n_points: int = 256,
     include_endpoint: bool = False,
     generator: torch.Generator | None = None,
+    noise_std: torch.Tensor | float | None = None,
     **kwargs,
 ) -> torch.Tensor:
     r"""Match the flow's time-marginal density to the data distribution.
@@ -196,6 +197,14 @@ def stationarity_loss(
             by default it is dropped so a closed cycle is not double-counted
             (uniform sampling of ``[0, T)``).
         generator: Optional RNG for the subsampling.
+        noise_std: If given, isotropic Gaussian noise with this per-dimension
+            std (scalar or ``[D]``) is added to the *pooled evolved cloud* before
+            the divergence, matching the deterministic flow's thin marginal to
+            the noisy data shell (``x = Gamma(theta) + noise`` model). Noise is
+            added to the evolved side only — ``data`` already carries its shell —
+            and once (reused inside the debiased triple), so the tangent field
+            stays the optimum. It is exogenous w.r.t. the field, so gradients
+            pass straight through to the trajectory.
         **kwargs: Forwarded to :func:`sinkhorn_divergence`.
 
     Returns:
@@ -209,6 +218,11 @@ def stationarity_loss(
     pooled = nodes.reshape(-1, nodes.shape[-1])  # [K*B, D], uniform in time
 
     pooled = _subsample(pooled, n_points, generator)
+    if noise_std is not None:
+        eps = torch.randn(
+            pooled.shape, device=pooled.device, dtype=pooled.dtype, generator=generator
+        )
+        pooled = pooled + eps * noise_std
     target = _subsample(data, n_points, generator)
     return sinkhorn_divergence(pooled, target, reg=reg, **kwargs)
 

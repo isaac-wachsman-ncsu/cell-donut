@@ -2,3 +2,5 @@ grid_search/
 adata_wangle.h5ad
 grid_search/
 adata_wangle.h5ad
+grid_out/
+grid_out_2_initfalse/

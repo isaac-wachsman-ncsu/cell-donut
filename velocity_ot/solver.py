@@ -13,6 +13,8 @@
 from __future__ import annotations
 
 import copy
+import math
+import random
 from dataclasses import dataclass
 from typing import Any, Sequence
 
@@ -21,6 +23,7 @@ import torch
 
 from . import graph_ot
 from . import losses as L
+from . import manifold
 from .circular_gradient import estimate_gradient_field
 from .dynamics import ODEIntegrator
 from .models import VelocityNet
@@ -41,8 +44,8 @@ class Stage:
         name: Label shown in the progress bar / logs.
         epochs: Number of epochs for this stage.
         lr: Learning rate for this stage (``None`` -> estimator ``lr``).
-        lambda_ke, lambda_stationarity, lambda_align, lambda_ot_sub: Per-stage
-            loss weights (``None`` -> the estimator's value).
+        lambda_ke, lambda_stationarity, lambda_align, lambda_ot_sub,
+        lambda_lcycle: Per-stage loss weights (``None`` -> the estimator's value).
     """
 
     name: str = "train"
@@ -52,6 +55,7 @@ class Stage:
     lambda_stationarity: float | None = None
     lambda_align: float | None = None
     lambda_ot_sub: float | None = None
+    lambda_lcycle: float | None = None
 
 
 def load_stages(spec) -> list[Stage] | None:
@@ -117,6 +121,14 @@ class VelocityFieldEstimator:
         lambda_align: Weight :math:`\\lambda_3` of the alignment term.
         lambda_ot_sub: Weight :math:`\\lambda_4` of the cycle-consistency
             (``OT_sub``: subset returns to itself after one cycle) term.
+        lambda_lcycle: Weight of the limit-cycle MSE term ``L_lcycle``. This
+            estimates the 1-D limit cycle ``Gamma(theta)`` (periodic spline) and
+            the density-implied velocity on it (angular speed ``~ 1/rho(theta)``,
+            normalised to one loop per ``T``), then supervises the field *only on
+            the cycle* with ``mean||v(Gamma) - v_target||^2``. It hands the field
+            the correct on-manifold speed and direction directly, instead of
+            forcing the OT terms to discover them. ``0`` (default) disables it
+            (and skips the manifold estimation unless another feature needs it).
         sinkhorn_reg: Entropic regularisation for all OT terms.
         sinkhorn_iter: Maximum Sinkhorn iterations.
         stationarity_n_points: Cap on the number of points per side of the
@@ -134,6 +146,36 @@ class VelocityFieldEstimator:
             through the long transient.
         stationarity_sample_loops: Number of cycles (with gradients) pooled after
             burn-in to form the stationarity marginal; ``>= 1`` covers the cycle.
+        stationarity_noise: If ``True``, add isotropic Gaussian noise (per-dim
+            std ``sigma`` estimated from the transverse residuals of the limit
+            cycle) to the *evolved* pooled trajectory before the stationarity
+            Sinkhorn divergence. This matches the deterministic flow's thin
+            marginal to the noisy data shell, removing the spurious spreading
+            gradient that otherwise fights alignment. Requires the manifold
+            estimate (turned on automatically). Noise is added to the evolved
+            side only — the data already carries its shell.
+        stationarity_floor_trials: If ``> 0``, estimate the irreducible
+            finite-sample floor of the stationarity divergence by averaging
+            ``S(subset, subset)`` over this many random equal-size data subsets,
+            and optimise ``relu(L_stat - floor)`` so the gradient vanishes at or
+            below the floor (no pushing into sampling/entropic noise). ``0``
+            (default) disables the offset.
+        ot_sub_curriculum: If ``True`` (default), the ``OT_sub`` target is
+            *annealed along the circular coordinate* over the epochs of each
+            stage instead of always being the source batch. Early epochs ask the
+            flow to carry the batch only a small forward step along the arc
+            (target near the source); as epochs progress the target sweeps
+            forward, and at the final epoch it wraps a full turn back to the
+            source, recovering the original ``S(Phi_T(x0), x0)`` objective. This
+            gently guides the field from short forward motion up to the full
+            loop. Set ``False`` to restore the plain return-to-self target.
+        lcycle_n_grid: Number of angular samples of the estimated limit cycle
+            used as ``L_lcycle`` supervision points.
+        lcycle_bins: Angular bins used to build the mean-cycle spline.
+        lcycle_bandwidth: Circular-KDE bandwidth (radians) for the on-cycle
+            density; ``None`` auto-sets it from the angular spacing.
+        lcycle_density_floor: Floor on the density (fraction of its median) that
+            bounds the ``1/rho`` on-cycle speed in sparse angular regions.
         normalize_cost: Rescale OT cost matrices to an ``O(1)`` scale.
         lr: Learning rate.
         weight_decay: Optimiser weight decay.
@@ -186,12 +228,20 @@ class VelocityFieldEstimator:
         lambda_stationarity: float = 1.0,
         lambda_align: float = 1.0,
         lambda_ot_sub: float = 1.0,
+        lambda_lcycle: float = 0.0,
         sinkhorn_reg: float = 0.05,
         sinkhorn_iter: int = 200,
         stationarity_n_points: int = 256,
         stationarity_seed_frac: float = 0.2,
         stationarity_burnin_loops: float = 3.0,
         stationarity_sample_loops: float = 1.0,
+        stationarity_noise: bool = False,
+        stationarity_floor_trials: int = 0,
+        ot_sub_curriculum: bool = True,
+        lcycle_n_grid: int = 256,
+        lcycle_bins: int = 64,
+        lcycle_bandwidth: float | None = None,
+        lcycle_density_floor: float = 0.1,
         normalize_cost: bool = True,
         lr: float = 1e-3,
         weight_decay: float = 0.0,
@@ -211,7 +261,7 @@ class VelocityFieldEstimator:
         init_phi_max: float = 50.0,
         init_max_cells: int = 2000,
         device: str | None = None,
-        seed: int | None = None,
+        seed: int | None = 0,
         verbose: bool = True,
     ) -> None:
         self.hidden_dims = tuple(hidden_dims)
@@ -227,6 +277,7 @@ class VelocityFieldEstimator:
         self.lambda_stationarity = float(lambda_stationarity)
         self.lambda_align = float(lambda_align)
         self.lambda_ot_sub = float(lambda_ot_sub)
+        self.lambda_lcycle = float(lambda_lcycle)
 
         self.sinkhorn_reg = float(sinkhorn_reg)
         self.sinkhorn_iter = int(sinkhorn_iter)
@@ -234,6 +285,13 @@ class VelocityFieldEstimator:
         self.stationarity_seed_frac = float(stationarity_seed_frac)
         self.stationarity_burnin_loops = float(stationarity_burnin_loops)
         self.stationarity_sample_loops = float(stationarity_sample_loops)
+        self.stationarity_noise = bool(stationarity_noise)
+        self.stationarity_floor_trials = int(stationarity_floor_trials)
+        self.ot_sub_curriculum = bool(ot_sub_curriculum)
+        self.lcycle_n_grid = int(lcycle_n_grid)
+        self.lcycle_bins = int(lcycle_bins)
+        self.lcycle_bandwidth = lcycle_bandwidth
+        self.lcycle_density_floor = float(lcycle_density_floor)
         self.normalize_cost = bool(normalize_cost)
 
         self.lr = float(lr)
@@ -273,6 +331,12 @@ class VelocityFieldEstimator:
         self.pca_ = None                 # fit-space PCA (raw -> fit space), or None
         self.fit_key_: str | None = None  # obsm key holding the fit-space coords
         self._plot_reducers: dict = {}    # cache of {(basis, k): fitted reducer}
+        # Limit-cycle supervision cache (populated in `fit` when needed).
+        self.limit_cycle_ = None          # manifold.LimitCycle, or None
+        self._gamma_pts = None            # [M, D] cycle points (fit space), tensor
+        self._gamma_vel = None            # [M, D] target on-cycle velocity, tensor
+        self._noise_std = None            # [D] transverse noise std, tensor
+        self._stat_floor: float | None = None  # irreducible stationarity floor
 
     # ------------------------------------------------------------------ #
     #  Helpers
@@ -400,6 +464,44 @@ class VelocityFieldEstimator:
             normalize_cost=self.normalize_cost,
         )
 
+    def _estimate_stationarity_floor(self, X, n_points, sk, trials):
+        """Irreducible finite-sample floor of the stationarity divergence.
+
+        Averages the Sinkhorn divergence between two independent random data
+        subsets (each of size ``n_points``, matching the stationarity
+        comparison). This is the value the term cannot go below from finite
+        sampling and entropic bias alone; subtracting it lets the optimiser stop
+        pushing the flow into that noise. Computed once, without gradients.
+        """
+        n = X.shape[0]
+        m = min(n_points, n)
+        vals = []
+        with torch.no_grad():
+            for _ in range(int(trials)):
+                a = X[torch.randperm(n, device=X.device)[:m]]
+                b = X[torch.randperm(n, device=X.device)[:m]]
+                vals.append(float(L.sinkhorn_divergence(a, b, **sk)))
+        return float(np.mean(vals)) if vals else 0.0
+
+    def _set_seed(self, seed: int | None) -> None:
+        """Seed every RNG the training touches so a run is reproducible.
+
+        Covers the Python, NumPy and PyTorch (CPU + CUDA) generators and asks
+        cuDNN for deterministic kernels. All the model init, batch shuffling,
+        stationarity-seed sampling and Sinkhorn subsampling draw from these, so
+        seeding here makes :meth:`fit` reproducible end to end. A ``None`` seed
+        opts out and leaves the global RNG state untouched.
+        """
+        if seed is None:
+            return
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
     def _init_stage(
         self,
         X: torch.Tensor,
@@ -496,7 +598,53 @@ class VelocityFieldEstimator:
         except Exception:  # pragma: no cover
             return range(n_epochs)
 
-    def _run_stage(self, stage, X, G, theta_order, seed_w, integrator, sk, n, batch_size):
+    def _ot_sub_target(
+        self,
+        idx: torch.Tensor,
+        theta_t: torch.Tensor,
+        X: torch.Tensor,
+        epoch: int,
+        n_epochs: int,
+    ) -> torch.Tensor:
+        """Epoch-annealed target cloud for the ``OT_sub`` term.
+
+        The target is the source batch ``X[idx]`` carried forward along the
+        circular coordinate by an angle ``delta`` that ramps linearly from ``0``
+        at ``epoch == 0`` to ``2*pi`` at the final epoch. Each shifted angle
+        ``theta_i + delta`` is snapped to its nearest data point (by circular
+        distance), so the target is always a genuine cloud on the data manifold.
+
+        At ``delta == 0`` and ``delta == 2*pi`` (first / last epoch) every point
+        maps back to itself, so the target coincides with the source batch and
+        the term reduces to the original ``S(Phi_T(x0), x0)`` periodicity anchor.
+        In between, the flow is asked to transport the batch only part-way round
+        the arc, which gently ramps the demanded loop fraction. With
+        ``ot_sub_curriculum=False`` the plain source batch is returned.
+
+        Args:
+            idx: Indices of the current batch into ``X`` / ``theta_t``.
+            theta_t: Per-point circular coordinate ``[N]`` (radians).
+            X: Fit-space coordinates ``[N, D]``.
+            epoch: Current (within-stage) epoch index.
+            n_epochs: Number of epochs in the stage (sets the ramp horizon).
+
+        Returns:
+            Target coordinates ``[B, D]`` (detached from the graph; used only as
+            the fixed sink of the Sinkhorn divergence).
+        """
+        if not self.ot_sub_curriculum:
+            return X[idx]
+        two_pi = 2.0 * math.pi
+        frac = epoch / max(n_epochs - 1, 1)          # 0 -> 1 over the stage
+        delta = two_pi * frac                        # forward angular step
+        phi = torch.remainder(theta_t[idx] + delta, two_pi)          # [B]
+        # Circular distance from every shifted query angle to every data angle.
+        dang = torch.remainder(theta_t[None, :] - phi[:, None], two_pi)  # [B, N]
+        dcirc = torch.minimum(dang, two_pi - dang)
+        tgt_idx = dcirc.argmin(dim=1)                                    # [B]
+        return X[tgt_idx]
+
+    def _run_stage(self, stage, X, G, theta_order, seed_w, integrator, sk, n, batch_size, theta_t):
         """Run one training stage; return ``(history, best_info)``.
 
         Only the losses with non-zero (resolved) weight are computed, so a stage
@@ -507,11 +655,13 @@ class VelocityFieldEstimator:
         w_stat = self.lambda_stationarity if stage.lambda_stationarity is None else stage.lambda_stationarity
         w_align = self.lambda_align if stage.lambda_align is None else stage.lambda_align
         w_sub = self.lambda_ot_sub if stage.lambda_ot_sub is None else stage.lambda_ot_sub
+        w_lcyc = self.lambda_lcycle if stage.lambda_lcycle is None else stage.lambda_lcycle
         lr = self.lr if stage.lr is None else stage.lr
         need_traj = (w_ke > 0.0) or (w_sub > 0.0)  # the [0, T] rollout
+        noise_std = self._noise_std if self.stationarity_noise else None
 
         opt = self._build_optimizer(lr=lr)
-        hist = {k: [] for k in ("total", "ke", "stationarity", "align", "ot_sub")}
+        hist = {k: [] for k in ("total", "ke", "stationarity", "align", "ot_sub", "lcycle")}
         best_state, best_loss, best_epoch = None, float("inf"), None
 
         bar = self._progress(stage.epochs, f"[{stage.name}]")
@@ -525,14 +675,19 @@ class VelocityFieldEstimator:
                 idx = perm[start : start + batch_size]
                 x0 = X[idx]
                 zero = torch.zeros((), device=self.device)
-                l_ke = l_stat = l_align = l_sub = zero
+                l_ke = l_stat = l_align = l_sub = l_lcyc = zero
 
                 if need_traj:
                     result = integrator(x0, t_end=self.T)
                     if w_ke > 0.0:
                         l_ke = L.kinetic_energy_loss(result.velocities, result.dt)
                     if w_sub > 0.0:
-                        l_sub = L.cycle_consistency_loss(x0, result.endpoint, **sk)
+                        # Curriculum target: the batch translated forward along
+                        # the circular coordinate by an epoch-growing angle
+                        # (0 -> 2*pi); at the first and last epoch it equals the
+                        # source batch, recovering S(Phi_T(x0), x0).
+                        target = self._ot_sub_target(idx, theta_t, X, epoch, stage.epochs)
+                        l_sub = L.cycle_consistency_loss(target, result.endpoint, **sk)
                 if w_align > 0.0:
                     l_align = L.angular_alignment_loss(self.model(x0), G[idx])
                 if w_stat > 0.0:
@@ -546,10 +701,20 @@ class VelocityFieldEstimator:
                             x_seed = integrator(x_seed, t_end=(epoch // 10 + 1) * self.T).endpoint
                     loc = integrator(x_seed, t_end=self.stationarity_sample_loops * self.T)
                     l_stat = L.stationarity_loss(
-                        loc.trajectory, X, n_points=self.stationarity_n_points, **sk
+                        loc.trajectory, X, n_points=self.stationarity_n_points,
+                        noise_std=noise_std, **sk
                     )
+                    if self._stat_floor is not None:
+                        # Stop pushing once at/below the irreducible floor.
+                        l_stat = torch.clamp(l_stat - self._stat_floor, min=0.0)
+                if w_lcyc > 0.0:
+                    # MSE to the density-implied velocity, on the cycle only.
+                    l_lcyc = ((self.model(self._gamma_pts) - self._gamma_vel) ** 2).sum(-1).mean()
 
-                loss = w_ke * l_ke + w_stat * l_stat + w_align * l_align + w_sub * l_sub
+                loss = (
+                    w_ke * l_ke + w_stat * l_stat + w_align * l_align
+                    + w_sub * l_sub + w_lcyc * l_lcyc
+                )
                 opt.zero_grad()
                 loss.backward()
                 opt.step()
@@ -559,6 +724,7 @@ class VelocityFieldEstimator:
                 es["stationarity"] += float(l_stat.detach())
                 es["align"] += float(l_align.detach())
                 es["ot_sub"] += float(l_sub.detach())
+                es["lcycle"] += float(l_lcyc.detach())
                 nb += 1
 
             for k in hist:
@@ -574,13 +740,15 @@ class VelocityFieldEstimator:
                 if w_stat > 0: active["stat"] = hist["stationarity"][-1]
                 if w_align > 0: active["align"] = hist["align"][-1]
                 if w_sub > 0: active["sub"] = hist["ot_sub"][-1]
+                if w_lcyc > 0: active["lcyc"] = hist["lcycle"][-1]
                 bar.set_postfix({k: f"{v:.3f}" for k, v in active.items()})
 
         if best_state is not None:
             self.model.load_state_dict(best_state)
         return hist, {"best_epoch": best_epoch, "best_loss": best_loss,
                       "weights": {"ke": w_ke, "stationarity": w_stat,
-                                  "align": w_align, "ot_sub": w_sub}, "lr": lr}
+                                  "align": w_align, "ot_sub": w_sub,
+                                  "lcycle": w_lcyc}, "lr": lr}
 
     # ------------------------------------------------------------------ #
     #  Fitting
@@ -638,9 +806,7 @@ class VelocityFieldEstimator:
             ``self``, with :attr:`model` and :attr:`history` populated, and the
             fitted velocity field written to ``adata.obsm[velocity_key]``.
         """
-        if self.seed is not None:
-            torch.manual_seed(self.seed)
-            np.random.seed(self.seed)
+        self._set_seed(self.seed)
 
         # ---- 1. extract data -------------------------------------------------
         X_raw = self._get_spatial(adata, spatial_key)
@@ -678,6 +844,12 @@ class VelocityFieldEstimator:
 
         X = torch.as_tensor(X_np, device=self.device)
         G = torch.as_tensor(grad_np, device=self.device)
+        # Per-point circular coordinate, used to anneal the OT_sub target along
+        # the arc during training. Copy so the source array's writeability flag
+        # does not leak into the tensor.
+        theta_t = torch.as_tensor(
+            np.array(theta_np, dtype=np.float32, copy=True), device=self.device, dtype=X.dtype
+        )
 
         # ---- 3. model + optimiser --------------------------------------------
         self.model = VelocityNet(
@@ -710,7 +882,32 @@ class VelocityFieldEstimator:
         if stage_list is None:  # backward-compatible single stage
             stage_list = [Stage(name="train", epochs=n_epochs)]
 
-        self.history = {"total": [], "ke": [], "stationarity": [], "align": [], "ot_sub": []}
+        # ---- 3c. limit-cycle manifold + noise/floor (only when requested) ----
+        def _stage_lcycle(s):
+            return self.lambda_lcycle if s.lambda_lcycle is None else s.lambda_lcycle
+
+        self.limit_cycle_ = None
+        self._gamma_pts = self._gamma_vel = self._noise_std = None
+        need_manifold = self.stationarity_noise or any(_stage_lcycle(s) > 0 for s in stage_list)
+        if need_manifold:
+            lc = manifold.estimate_limit_cycle(
+                X_np, theta_np, T=self.T, n_grid=self.lcycle_n_grid,
+                n_bins=self.lcycle_bins, bandwidth=self.lcycle_bandwidth,
+                density_floor=self.lcycle_density_floor,
+            )
+            self.limit_cycle_ = lc
+            self._gamma_pts = torch.as_tensor(lc.gamma, device=self.device, dtype=X.dtype)
+            self._gamma_vel = torch.as_tensor(lc.velocity, device=self.device, dtype=X.dtype)
+            self._noise_std = torch.as_tensor(lc.sigma, device=self.device, dtype=X.dtype)
+
+        self._stat_floor = None
+        if self.stationarity_floor_trials > 0:
+            self._stat_floor = self._estimate_stationarity_floor(
+                X, self.stationarity_n_points, sk, self.stationarity_floor_trials
+            )
+
+        self.history = {"total": [], "ke": [], "stationarity": [], "align": [],
+                        "ot_sub": [], "lcycle": []}
         self.stage_history_ = []
         self.best_loss_ = None
         self.best_epoch_ = None
@@ -719,7 +916,7 @@ class VelocityFieldEstimator:
             if stage.epochs <= 0:
                 continue
             hist, binfo = self._run_stage(
-                stage, X, G, theta_order, seed_w, integrator, sk, n, batch_size
+                stage, X, G, theta_order, seed_w, integrator, sk, n, batch_size, theta_t
             )
             for k in self.history:
                 self.history[k].extend(hist[k])
@@ -743,12 +940,23 @@ class VelocityFieldEstimator:
         adata.obsm[velocity_key] = self.predict(X_np)
         if grad_theta_out_key is not None:
             adata.obsm[grad_theta_out_key] = grad_np
+        lc = self.limit_cycle_
         adata.uns["velocity_ot"] = {
             "history": {k: list(v) for k, v in self.history.items()},
             "init_history": {k: list(v) for k, v in self.init_history.items()},
             "stages": self.stage_history_,
             "best_epoch": self.best_epoch_,
             "best_loss": self.best_loss_,
+            "stationarity_floor": self._stat_floor,
+            "limit_cycle": None if lc is None else {
+                "theta_grid": np.asarray(lc.theta_grid),
+                "gamma": np.asarray(lc.gamma),
+                "velocity": np.asarray(lc.velocity),
+                "speed": np.asarray(lc.speed),
+                "density": np.asarray(lc.density),
+                "sigma": np.asarray(lc.sigma),
+                "bandwidth": lc.bandwidth,
+            },
             "config": {
                 "hidden_dims": list(self.hidden_dims),
                 "activation": self.activation,
@@ -760,8 +968,13 @@ class VelocityFieldEstimator:
                     "stationarity": self.lambda_stationarity,
                     "align": self.lambda_align,
                     "ot_sub": self.lambda_ot_sub,
+                    "lcycle": self.lambda_lcycle,
                 },
                 "sinkhorn_reg": self.sinkhorn_reg,
+                "ot_sub_curriculum": self.ot_sub_curriculum,
+                "stationarity_noise": self.stationarity_noise,
+                "stationarity_floor_trials": self.stationarity_floor_trials,
+                "seed": self.seed,
                 "n_components": self.n_components,
                 "fit_key": self.fit_key_,
                 "fit_dim": self.dim_,
