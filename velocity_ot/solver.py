@@ -26,7 +26,7 @@ from . import losses as L
 from . import manifold
 from .circular_gradient import estimate_gradient_field
 from .dynamics import ODEIntegrator
-from .models import VelocityNet
+from .models import FactoredVelocityField, VelocityNet
 
 ArrayLike = np.ndarray | torch.Tensor | str
 
@@ -46,6 +46,10 @@ class Stage:
         lr: Learning rate for this stage (``None`` -> estimator ``lr``).
         lambda_ke, lambda_stationarity, lambda_align, lambda_ot_sub,
         lambda_lcycle: Per-stage loss weights (``None`` -> the estimator's value).
+        train: Which sub-network to optimise when the field is factored
+            (``factored=True``): ``"direction"``, ``"magnitude"``, or ``None``/
+            ``"both"`` (default). The other sub-network is frozen for the stage.
+            Ignored for the monolithic field.
     """
 
     name: str = "train"
@@ -56,6 +60,7 @@ class Stage:
     lambda_align: float | None = None
     lambda_ot_sub: float | None = None
     lambda_lcycle: float | None = None
+    train: str | None = None
 
 
 def load_stages(spec) -> list[Stage] | None:
@@ -108,6 +113,16 @@ class VelocityFieldEstimator:
 
     Args:
         hidden_dims: Hidden-layer widths of the velocity MLP.
+        factored: If ``True``, parameterise the field as
+            ``v(x) = magnitude(x) * direction(x)`` with two networks (a unit
+            direction ``R^D -> R^D`` and a non-negative speed ``R^D -> R``)
+            instead of one monolithic MLP. The composite is a drop-in field, so
+            usage is unchanged; per-network staging is controlled by
+            ``Stage.train``. Default ``False`` (single network, for comparison).
+        direction_hidden_dims: Hidden widths of the direction network when
+            ``factored`` (defaults to ``hidden_dims``).
+        magnitude_hidden_dims: Hidden widths of the magnitude network when
+            ``factored`` (defaults to ``hidden_dims``).
         activation: Activation name (see
             :data:`velocity_ot.models.ACTIVATION_FN`).
         layer_norm: Whether to layer-normalise hidden activations.
@@ -169,6 +184,17 @@ class VelocityFieldEstimator:
             source, recovering the original ``S(Phi_T(x0), x0)`` objective. This
             gently guides the field from short forward motion up to the full
             loop. Set ``False`` to restore the plain return-to-self target.
+        ot_sub_curriculum_hold: Fraction of each stage (at the end) during which
+            the annealed ``OT_sub`` target is *held* at a full turn (``delta ==
+            2*pi``), i.e. the true return-to-itself objective. The ramp reaches
+            ``2*pi`` at ``(1 - hold)`` of the stage and stays there, so the last
+            epochs train the real periodicity target rather than only touching it
+            on the final epoch. Also gates best-model selection (below).
+        restore_best: If ``True`` (default), each stage restores its lowest-total
+            model. Under the ``OT_sub`` curriculum this restore is restricted to
+            the *hold* phase, because early curriculum epochs have a near-trivial
+            target and an artificially low loss — otherwise selection regresses to
+            ~epoch 0. Set ``False`` to keep the final-epoch model instead.
         lcycle_n_grid: Number of angular samples of the estimated limit cycle
             used as ``L_lcycle`` supervision points.
         lcycle_bins: Angular bins used to build the mean-cycle spline.
@@ -218,6 +244,9 @@ class VelocityFieldEstimator:
     def __init__(
         self,
         hidden_dims: Sequence[int] = (128, 128, 128),
+        factored: bool = False,
+        direction_hidden_dims: Sequence[int] | None = None,
+        magnitude_hidden_dims: Sequence[int] | None = None,
         activation: str = "silu",
         layer_norm: bool = True,
         residual: bool = False,
@@ -238,6 +267,8 @@ class VelocityFieldEstimator:
         stationarity_noise: bool = False,
         stationarity_floor_trials: int = 0,
         ot_sub_curriculum: bool = True,
+        ot_sub_curriculum_hold: float = 0.25,
+        restore_best: bool = True,
         lcycle_n_grid: int = 256,
         lcycle_bins: int = 64,
         lcycle_bandwidth: float | None = None,
@@ -253,6 +284,7 @@ class VelocityFieldEstimator:
         pca_whiten: bool = False,
         init: bool = True,
         init_epochs: int = 100,
+        init_train: str | None = None,
         lambda_init: float = 1.0,
         init_knn: int | None = None,
         init_reg: float = 0.05,
@@ -265,6 +297,13 @@ class VelocityFieldEstimator:
         verbose: bool = True,
     ) -> None:
         self.hidden_dims = tuple(hidden_dims)
+        self.factored = bool(factored)
+        self.direction_hidden_dims = (
+            None if direction_hidden_dims is None else tuple(direction_hidden_dims)
+        )
+        self.magnitude_hidden_dims = (
+            None if magnitude_hidden_dims is None else tuple(magnitude_hidden_dims)
+        )
         self.activation = activation
         self.layer_norm = layer_norm
         self.residual = residual
@@ -288,6 +327,8 @@ class VelocityFieldEstimator:
         self.stationarity_noise = bool(stationarity_noise)
         self.stationarity_floor_trials = int(stationarity_floor_trials)
         self.ot_sub_curriculum = bool(ot_sub_curriculum)
+        self.ot_sub_curriculum_hold = float(ot_sub_curriculum_hold)
+        self.restore_best = bool(restore_best)
         self.lcycle_n_grid = int(lcycle_n_grid)
         self.lcycle_bins = int(lcycle_bins)
         self.lcycle_bandwidth = lcycle_bandwidth
@@ -305,6 +346,7 @@ class VelocityFieldEstimator:
         self.pca_whiten = bool(pca_whiten)
 
         self.init = bool(init)
+        self.init_train = init_train  # None/"both", "direction", or "magnitude" (factored only)
         self.init_epochs = int(init_epochs)
         self.lambda_init = float(lambda_init)
         self.init_knn = init_knn
@@ -320,7 +362,7 @@ class VelocityFieldEstimator:
         self.seed = seed
         self.verbose = verbose
 
-        self.model: VelocityNet | None = None
+        self.model: VelocityNet | FactoredVelocityField | None = None
         self.history: dict[str, list[float]] = {}
         self.init_history: dict[str, list[float]] = {}
         self.stage_history_: list = []
@@ -451,8 +493,9 @@ class VelocityFieldEstimator:
         opt_cls = {"adam": torch.optim.Adam, "adamw": torch.optim.AdamW}
         if self.optimizer not in opt_cls:
             raise ValueError(f"Unknown optimizer '{self.optimizer}'.")
+        params = [p for p in self.model.parameters() if p.requires_grad]
         return opt_cls[self.optimizer](
-            self.model.parameters(),
+            params,
             lr=self.lr if lr is None else lr,
             weight_decay=self.weight_decay,
         )
@@ -563,9 +606,9 @@ class VelocityFieldEstimator:
                 xb = X_sub[b]
                 loss_mse = ((self.model(xb) - U[b]) ** 2).sum(-1).mean()
                 # OT_sub keeps the flow periodic and prevents a degenerate field.
-                endpoint = integrator(xb, t_end=self.T).endpoint
-                loss_ot_sub = L.cycle_consistency_loss(xb, endpoint, **sk)
-                loss = self.lambda_init * loss_mse + self.lambda_ot_sub * loss_ot_sub
+                #endpoint = integrator(xb, t_end=self.T).endpoint
+                #loss_ot_sub = L.cycle_consistency_loss(xb, endpoint, **sk)
+                loss = self.lambda_init * loss_mse #+ self.lambda_ot_sub * loss_ot_sub
 
                 opt.zero_grad()
                 loss.backward()
@@ -573,7 +616,7 @@ class VelocityFieldEstimator:
 
                 stats["total"] += float(loss.detach())
                 stats["mse"] += float(loss_mse.detach())
-                stats["ot_sub"] += float(loss_ot_sub.detach())
+                #stats["ot_sub"] += float(loss_ot_sub.detach())
                 nb += 1
             for k in self.init_history:
                 self.init_history[k].append(stats[k] / max(nb, 1))
@@ -635,7 +678,11 @@ class VelocityFieldEstimator:
         if not self.ot_sub_curriculum:
             return X[idx]
         two_pi = 2.0 * math.pi
-        frac = epoch / max(n_epochs - 1, 1)          # 0 -> 1 over the stage
+        # Ramp delta 0 -> 2*pi over the first (1 - hold) of the stage, then hold
+        # at 2*pi so the last `hold` fraction of epochs trains the true
+        # return-to-itself objective (a full loop back to the source).
+        ramp_end = max((1.0 - self.ot_sub_curriculum_hold) * (n_epochs - 1), 1.0)
+        frac = min(epoch / ramp_end, 1.0)            # 0 -> 1, then held at 1
         delta = two_pi * frac                        # forward angular step
         phi = torch.remainder(theta_t[idx] + delta, two_pi)          # [B]
         # Circular distance from every shifted query angle to every data angle.
@@ -660,9 +707,26 @@ class VelocityFieldEstimator:
         need_traj = (w_ke > 0.0) or (w_sub > 0.0)  # the [0, T] rollout
         noise_std = self._noise_std if self.stationarity_noise else None
 
+        # Factored field: freeze the sub-network this stage does not train, so
+        # the (unchanged) losses only update the requested network.
+        if isinstance(self.model, FactoredVelocityField):
+            tr = stage.train
+            self.model.set_trainable(direction=tr in (None, "both", "direction"),
+                                     magnitude=tr in (None, "both", "magnitude"))
+
         opt = self._build_optimizer(lr=lr)
         hist = {k: [] for k in ("total", "ke", "stationarity", "align", "ot_sub", "lcycle")}
         best_state, best_loss, best_epoch = None, float("inf"), None
+        # Under the OT_sub curriculum the early epochs have a near-trivial target
+        # (delta ~ 0, i.e. return-to-source of a near-identity flow) so their
+        # total loss is artificially low; restoring "best" would regress to them.
+        # Only let the hold phase (delta == 2*pi, the real return-to-itself
+        # objective) be eligible for selection.
+        use_curric = self.ot_sub_curriculum and w_sub > 0.0
+        select_from = (
+            int(round((1.0 - self.ot_sub_curriculum_hold) * (stage.epochs - 1)))
+            if use_curric else 0
+        )
 
         bar = self._progress(stage.epochs, f"[{stage.name}]")
         use_bar = hasattr(bar, "set_postfix")
@@ -698,7 +762,7 @@ class VelocityFieldEstimator:
                     x_seed = X[arc]
                     if self.stationarity_burnin_loops > 0:
                         with torch.no_grad():
-                            x_seed = integrator(x_seed, t_end=(epoch // 10 + 1) * self.T).endpoint
+                            x_seed = integrator(x_seed, t_end=(self.stationarity_burnin_loops) * self.T).endpoint
                     loc = integrator(x_seed, t_end=self.stationarity_sample_loops * self.T)
                     l_stat = L.stationarity_loss(
                         loc.trajectory, X, n_points=self.stationarity_n_points,
@@ -729,7 +793,7 @@ class VelocityFieldEstimator:
 
             for k in hist:
                 hist[k].append(es[k] / max(nb, 1))
-            if hist["total"][-1] < best_loss:
+            if self.restore_best and epoch >= select_from and hist["total"][-1] < best_loss:
                 best_loss = float(hist["total"][-1])
                 best_epoch = int(epoch)
                 best_state = {k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()}
@@ -745,6 +809,9 @@ class VelocityFieldEstimator:
 
         if best_state is not None:
             self.model.load_state_dict(best_state)
+        else:  # restore_best=False (or no eligible epoch): keep the final model
+            best_loss = float(hist["total"][-1]) if hist["total"] else float("nan")
+            best_epoch = stage.epochs - 1
         return hist, {"best_epoch": best_epoch, "best_loss": best_loss,
                       "weights": {"ke": w_ke, "stationarity": w_stat,
                                   "align": w_align, "ot_sub": w_sub,
@@ -852,13 +919,23 @@ class VelocityFieldEstimator:
         )
 
         # ---- 3. model + optimiser --------------------------------------------
-        self.model = VelocityNet(
-            dim=d,
-            hidden_dims=self.hidden_dims,
-            activation=self.activation,
-            layer_norm=self.layer_norm,
-            residual=self.residual,
-        ).to(self.device)
+        if self.factored:
+            self.model = FactoredVelocityField(
+                dim=d,
+                direction_hidden_dims=self.direction_hidden_dims or self.hidden_dims,
+                magnitude_hidden_dims=self.magnitude_hidden_dims or self.hidden_dims,
+                activation=self.activation,
+                layer_norm=self.layer_norm,
+                residual=self.residual,
+            ).to(self.device)
+        else:
+            self.model = VelocityNet(
+                dim=d,
+                hidden_dims=self.hidden_dims,
+                activation=self.activation,
+                layer_norm=self.layer_norm,
+                residual=self.residual,
+            ).to(self.device)
         integrator = ODEIntegrator(self.model, method=self.method, n_steps=self.n_steps, T=self.T)
         sk = self._sinkhorn_kwargs()
 
@@ -868,7 +945,12 @@ class VelocityFieldEstimator:
         # ---- 3b. graph-OT initialisation stage -------------------------------
         self.init_history = {}
         if self.init and self.init_epochs > 0:
+            if isinstance(self.model, FactoredVelocityField) and self.init_train in ("direction", "magnitude"):
+                self.model.set_trainable(direction=self.init_train == "direction",
+                                         magnitude=self.init_train == "magnitude")
             self._init_stage(X, theta_np, integrator, sk, batch_size, eff_res_fn=eff_res_fn)
+            if isinstance(self.model, FactoredVelocityField):
+                self.model.set_trainable(True, True)  # restore before main stages
             adata.obsm["velocity_init"] = self.predict(X_np)
             self.model.train()
 
@@ -922,6 +1004,7 @@ class VelocityFieldEstimator:
                 self.history[k].extend(hist[k])
             binfo["name"] = stage.name
             binfo["epochs"] = stage.epochs
+            binfo["train"] = stage.train
             binfo["global_best_epoch"] = (
                 offset + binfo["best_epoch"] if binfo["best_epoch"] is not None else None
             )
@@ -935,6 +1018,9 @@ class VelocityFieldEstimator:
                     f"[{stage.name}] best epoch {binfo['best_epoch']} "
                     f"(total={binfo['best_loss']:.4f}) restored"
                 )
+
+        if isinstance(self.model, FactoredVelocityField):
+            self.model.set_trainable(True, True)  # leave the field fully unfrozen
 
         # ---- 5. write outputs back to AnnData --------------------------------
         adata.obsm[velocity_key] = self.predict(X_np)
@@ -959,6 +1045,7 @@ class VelocityFieldEstimator:
             },
             "config": {
                 "hidden_dims": list(self.hidden_dims),
+                "factored": self.factored,
                 "activation": self.activation,
                 "method": self.method,
                 "n_steps": self.n_steps,
@@ -972,6 +1059,8 @@ class VelocityFieldEstimator:
                 },
                 "sinkhorn_reg": self.sinkhorn_reg,
                 "ot_sub_curriculum": self.ot_sub_curriculum,
+                "ot_sub_curriculum_hold": self.ot_sub_curriculum_hold,
+                "restore_best": self.restore_best,
                 "stationarity_noise": self.stationarity_noise,
                 "stationarity_floor_trials": self.stationarity_floor_trials,
                 "seed": self.seed,

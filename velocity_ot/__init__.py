@@ -32,7 +32,7 @@ from .losses import (
     sinkhorn_divergence,
     stationarity_loss,
 )
-from .models import ACTIVATION_FN, VelocityNet
+from .models import ACTIVATION_FN, FactoredVelocityField, VelocityNet
 from .solver import Stage, VelocityFieldEstimator, load_stages
 
 __version__ = "0.1.0"
@@ -44,6 +44,7 @@ __all__ = [
     "load_stages",
     # models
     "VelocityNet",
+    "FactoredVelocityField",
     "ACTIVATION_FN",
     # dynamics
     "integrate",

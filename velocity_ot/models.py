@@ -59,6 +59,7 @@ class VelocityNet(nn.Module):
         activation: str = "silu",
         layer_norm: bool = True,
         residual: bool = False,
+        out_dim: int | None = None,
     ) -> None:
         super().__init__()
 
@@ -90,7 +91,10 @@ class VelocityNet(nn.Module):
         self.hidden_blocks = nn.ModuleList(blocks)
         self._hidden_widths = widths
         # The read-out is linear (no activation): a velocity can take any sign.
-        self.output_layer = nn.Linear(in_dim, self.dim)
+        # ``out_dim`` defaults to ``dim`` (a full velocity); set to 1 for a
+        # scalar read-out (e.g. the magnitude sub-net of a factored field).
+        self.out_dim = int(dim if out_dim is None else out_dim)
+        self.output_layer = nn.Linear(in_dim, self.out_dim)
 
         self._initialise_weights()
 
@@ -126,3 +130,68 @@ class VelocityNet(nn.Module):
             else:
                 h = out
         return self.output_layer(h)
+
+
+class FactoredVelocityField(nn.Module):
+    r"""Velocity field factored into a direction and a magnitude network.
+
+    The field is written :math:`v_\phi(x) = m_\psi(x)\,\hat d_\omega(x)`, where
+
+    * :math:`\hat d_\omega : \mathbb{R}^D \to \mathbb{R}^D` is a **direction**
+      network whose output is normalised to unit length, and
+    * :math:`m_\psi : \mathbb{R}^D \to \mathbb{R}_{\ge 0}` is a **magnitude**
+      (speed) network with a non-negative (softplus) read-out.
+
+    Because :meth:`forward` still maps ``[B, D] -> [B, D]``, this module is a
+    drop-in replacement for :class:`VelocityNet`: the integrator, ``predict``
+    and every loss are unchanged. Separating speed from direction lets each
+    sub-problem be trained on its own losses and in its own stage (freeze one
+    network, train the other via :meth:`set_trainable`).
+
+    Args:
+        dim: Ambient dimension ``D``.
+        direction_hidden_dims: Hidden widths of the direction network.
+        magnitude_hidden_dims: Hidden widths of the magnitude network.
+        activation, layer_norm, residual: Passed to both sub-networks.
+        eps: Floor on the direction norm before normalising (stability).
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        direction_hidden_dims: Sequence[int] = (128, 128, 128),
+        magnitude_hidden_dims: Sequence[int] = (128, 128, 128),
+        activation: str = "silu",
+        layer_norm: bool = True,
+        residual: bool = False,
+        eps: float = 1e-8,
+    ) -> None:
+        super().__init__()
+        self.dim = int(dim)
+        self.eps = float(eps)
+        self.direction_net = VelocityNet(
+            dim, direction_hidden_dims, activation, layer_norm, residual
+        )
+        self.magnitude_net = VelocityNet(
+            dim, magnitude_hidden_dims, activation, layer_norm, residual, out_dim=1
+        )
+
+    def direction(self, x: torch.Tensor) -> torch.Tensor:
+        """Unit-norm direction ``[B, D]``."""
+        r = self.direction_net(x)
+        return r / r.norm(dim=-1, keepdim=True).clamp_min(self.eps)
+
+    def magnitude(self, x: torch.Tensor) -> torch.Tensor:
+        """Non-negative speed ``[B, 1]``."""
+        return nn.functional.softplus(self.magnitude_net(x))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Velocity ``v(x) = magnitude(x) * direction(x)`` of shape ``[B, D]``."""
+        return self.magnitude(x) * self.direction(x)
+
+    def set_trainable(self, direction: bool = True, magnitude: bool = True) -> None:
+        """Freeze/unfreeze each sub-network (for per-network staging)."""
+        for p in self.direction_net.parameters():
+            p.requires_grad_(direction)
+        for p in self.magnitude_net.parameters():
+            p.requires_grad_(magnitude)
