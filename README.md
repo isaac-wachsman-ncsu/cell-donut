@@ -11,9 +11,14 @@ distribution of a system whose state cycles with period `T`. We recover the
 per-point velocity that generates that cycle.
 
 ## Installation
+Using conda is the preferred way to install dependencies for this package.
+To install the velocity_ot package, navigate to your desired installation location in a terminal and run the following commands:
 
 ```bash
-pip install torch POT anndata scipy numpy
+git clone https://github.com/isaac-wachsman-ncsu/cell-donut.git #Downloads the repository to your local machine
+conda create --name cell-donut python=3.10.20 #Create a conda environment
+conda activate cell-donut #Activate conda environment
+pip install -r requirements.txt #Install dependencies
 ```
 
 Drop the `velocity_ot/` package on your `PYTHONPATH` and `import velocity_ot`.
